@@ -29,6 +29,30 @@ public class Track {
     public String localUri = "";
     public String error = "";
 
+    /**
+     * Direct audio URL for real-time playback.
+     *
+     * Set by {@link DownloadEngine#resolveStream} while a row is streaming. It is a short
+     * lived CDN link, so it is deliberately NOT persisted in {@link #toJson}: a url from
+     * the last session is dead by the next launch, and a stale one would fail as "cannot
+     * play" instead of being resolved again.
+     */
+    public String streamUrl = "";
+
+    /** True while a background prefetch is resolving this row's stream url. */
+    public transient boolean prefetching = false;
+
+    /** True when this row is heard from the network rather than from a saved file. */
+    public boolean isStreaming() {
+        return streamUrl != null && !streamUrl.isEmpty();
+    }
+
+    /** The uri playback should open: the saved file when there is one, else the stream. */
+    public String playbackUri() {
+        if (localUri != null && !localUri.isEmpty()) return localUri;
+        return streamUrl == null ? "" : streamUrl;
+    }
+
     public Track() {
     }
 

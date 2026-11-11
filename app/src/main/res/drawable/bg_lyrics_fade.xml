@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Dissolves the bottom of the lyric list into the panel.
+
+    The list is a fixed-height viewport, so a row is always partly visible at its lower
+    edge. Cut with no affordance that reads as broken text; faded, it reads as "more
+    below".
+
+    The end colour is the panel's rendered colour as measured on device (rgb(16,20,15)),
+    not its declared #E6040A06 - the panel is translucent over a blurred backdrop, so the
+    declared value is not what reaches the screen and fading to it would leave a band.
+
+    The midpoint sits at #C010140F: with a 42dp height, most of the opacity is already
+    applied by the middle of the scrim, which is what hides a whole partial line instead
+    of only softening its last few pixels.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient
+        android:angle="90"
+        android:centerColor="#C010140F"
+        android:centerY="0.55"
+        android:endColor="#FF10140F"
+        android:startColor="#0010140F"
+        android:type="linear" />
+</shape>

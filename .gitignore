@@ -25,6 +25,15 @@ tts/
 voice_preview/
 tools/*.py
 
+# Local session debris (screenshots, UI dumps, scratch logs, hand-made backups)
+_*.png
+_*.xml
+_*.txt
+_*.json
+*.bak
+*.pre_*
+_backups/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -56,8 +56,8 @@
                     android:layout_height="wrap_content"
                     android:letterSpacing="0.12"
                     android:text="PLAYING FROM"
-                    android:textColor="@color/text_tertiary"
-                    android:textSize="9sp" />
+                    android:textColor="@color/text_secondary"
+                    android:textSize="10sp" />
 
                 <TextView
                     android:id="@+id/playerSource"
@@ -71,6 +71,24 @@
                     android:textSize="12sp"
                     android:textStyle="bold" />
             </LinearLayout>
+
+            <!--
+                Save the song that is playing, without leaving the player.
+
+                It used to live two levels deep in the overflow, which is the one action a
+                stream needs most: the song is right there, sounding correct, and keeping
+                it must not cost a menu. Tapping starts the download and does not pause or
+                restart playback.
+            -->
+            <ImageButton
+                android:id="@+id/playerDownload"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Download this song"
+                android:padding="10dp"
+                android:src="@drawable/ic_download"
+                android:tint="@color/text_primary" />
 
             <ImageButton
                 android:id="@+id/queueButton"
@@ -98,7 +116,9 @@
             <androidx.viewpager2.widget.ViewPager2
                 android:id="@+id/artPager"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent" />
+                android:layout_height="match_parent"
+                android:clipChildren="true"
+                android:clipToPadding="true" />
         </com.cartify.app.SquareFrameLayout>
 
         <!-- lyric sheet: same width and corners as the artwork, opening right under it -->
@@ -163,19 +183,39 @@
                     android:textSize="11sp"
                     android:visibility="gone" />
 
-                <androidx.recyclerview.widget.RecyclerView
-                    android:id="@+id/lyricsList"
+                <FrameLayout
+                    android:id="@+id/lyricsListHost"
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
                     android:layout_marginTop="6dp"
                     android:layout_weight="1"
-                    android:clipToPadding="false"
-                    android:clipToOutline="true"
-                    android:paddingTop="10dp"
-                    android:paddingEnd="2dp"
-                    android:paddingBottom="10dp"
-                    android:scrollbars="none"
-                    android:visibility="gone" />
+                    android:visibility="gone">
+
+                    <androidx.recyclerview.widget.RecyclerView
+                        android:id="@+id/lyricsList"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:clipToPadding="false"
+                        android:clipToOutline="true"
+                        android:paddingTop="10dp"
+                        android:paddingEnd="2dp"
+                        android:paddingBottom="14dp"
+                        android:scrollbars="none"
+                        android:visibility="gone" />
+
+                    <!-- Drawn over the list's lower edge so a half-visible row dissolves
+                         instead of being cut. Never clickable: it must not eat a tap meant
+                         for the lyrics underneath. -->
+                    <View
+                        android:id="@+id/lyricsFade"
+                        android:layout_width="match_parent"
+                        android:layout_height="42dp"
+                        android:layout_gravity="bottom"
+                        android:background="@drawable/bg_lyrics_fade"
+                        android:clickable="false"
+                        android:focusable="false"
+                        android:visibility="gone" />
+                </FrameLayout>
             </LinearLayout>
         </FrameLayout>
 

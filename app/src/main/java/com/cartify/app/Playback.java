@@ -57,6 +57,28 @@ public final class Playback {
     private String source = "";
 
     /**
+     * Resolves remote stream URLs, one at a time.
+     *
+     * A stream is a yt-dlp run, so it is not free: single-threaded keeps two taps from
+     * starting two extractions, and the token makes a stale result a no-op instead of
+     * starting the track the user has already skipped past.
+     */
+    /**
+     * Two threads, not one: the next track's url is prefetched while the current one
+     * plays, so a single thread would make "next" wait behind that prefetch - exactly
+     * the delay the prefetch exists to remove.
+     */
+    private final java.util.concurrent.ExecutorService resolver =
+            java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "cartify-stream-resolver");
+                t.setDaemon(true);
+                return t;
+            });
+    private int loadToken;
+    /** Set while the current track is waiting on its stream URL, not on a file. */
+    private boolean resolvingStream;
+
+    /**
      * Audio focus, so a call or another player can take the speakers away.
      *
      * Nothing asked for focus before: music kept playing over an incoming call and
@@ -208,10 +230,75 @@ public final class Playback {
         Track t = current();
         release();
         pendingSeek = -1;
-        if (t == null || t.localUri == null || t.localUri.isEmpty()) {
+        if (t == null) {
             notifyPlayback();
             return;
         }
+        // A saved file always wins: it plays instantly and works offline. Only a row
+        // that was never downloaded resolves a stream, which is the whole point of
+        // being able to hear a search result without saving it first.
+        if (!t.localUri.isEmpty()) {
+            open(t.localUri, t, null);
+        } else if (!t.streamUrl.isEmpty()) {
+            // A CDN url is short lived. If it is refused it is re-resolved once instead
+            // of skipping the song, because the upload itself was found fine.
+            open(t.streamUrl, t, () -> {
+                t.streamUrl = "";
+                if (current() == t) resolveAndOpen(t);
+            });
+        } else {
+            resolveAndOpen(t);
+        }
+        // The next track's url is resolved while this one plays, so pressing next lands
+        // on a ready address instead of a spinner. One ahead is enough: a deeper prefetch
+        // would run extractions for songs the listener may never reach.
+        prefetchNextStream();
+    }
+
+    /**
+     * Warms the stream url of the track after the current one.
+     *
+     * Resolution is the whole wait before a streamed song is heard (a yt-dlp run of a few
+     * seconds), and it depends only on metadata that is already in the queue. Doing it in
+     * the background means the wait is paid while the previous song is still playing.
+     */
+    private void prefetchNextStream() {
+        final Track next = peekNext();
+        if (next == null) return;
+        if (!next.localUri.isEmpty()) return;        // plays from disk: nothing to resolve
+        if (!next.streamUrl.isEmpty()) return;       // already warmed
+        if (next.prefetching) return;
+        next.prefetching = true;
+        resolver.execute(() -> {
+            try {
+                String url = DownloadEngine.resolveStream(app, next, null);
+                if (url != null && !url.isEmpty()) next.streamUrl = url;
+            } catch (Throwable e) {
+                // A failed prefetch is not an error the user needs to see: the track
+                // resolves again, visibly, when it actually becomes current.
+                Log.d(TAG, "prefetch failed for " + next.title);
+            } finally {
+                next.prefetching = false;
+            }
+        });
+    }
+
+    /** The track that a plain "next" would play, without changing anything. */
+    private Track peekNext() {
+        if (queue.isEmpty()) return null;
+        if (shuffle) {
+            if (order.isEmpty()) return null;
+            int pos = order.indexOf(index);
+            if (pos < 0 || pos + 1 >= order.size()) return null;
+            int i = order.get(pos + 1);
+            return i >= 0 && i < queue.size() ? queue.get(i) : null;
+        }
+        int i = index + 1;
+        return i >= 0 && i < queue.size() ? queue.get(i) : null;
+    }
+
+    /** Opens a local file or a resolved stream url in the player. */
+    private void open(String uri, Track t, Runnable onError) {
         loading = true;
         try {
             MediaPlayer mp = new MediaPlayer();
@@ -219,7 +306,16 @@ public final class Playback {
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build());
-            mp.setDataSource(app, Uri.parse(t.localUri));
+            // A remote stream is not a content provider uri: handing an https url to
+            // the Context overload makes ContentResolver throw FileNotFoundException
+            // ("No content provider") on the main thread before MediaPlayer quietly
+            // retries with the string form. Only content:// and file paths belong on
+            // the resolver path; everything else goes straight to the string overload.
+            if (uri.startsWith("http://") || uri.startsWith("https://")) {
+                mp.setDataSource(uri);
+            } else {
+                mp.setDataSource(app, Uri.parse(uri));
+            }
             mp.setOnPreparedListener(m -> {
                 loading = false;
                 if (pendingSeek > 0) {
@@ -234,10 +330,10 @@ public final class Playback {
                     requestFocus();
                     m.start();
                     ensureService();
-                    // Every play path - row, shuffle, auto-advance, notification -
-                    // reaches playback through this listener, so recording here is
-                    // the only place that keeps the history complete.
-                    Recent.remember(app, t.localUri);
+                    // Only saved files enter the history: a stream has no uri that
+                    // survives the session, and a history entry that cannot play is
+                    // worse than none.
+                    if (!t.localUri.isEmpty()) Recent.remember(app, t.localUri);
                 }
                 notifyPlayback();
             });
@@ -246,16 +342,62 @@ public final class Playback {
                 loading = false;
                 Log.w(TAG, "player error " + what + "/" + extra + " on " + t.title);
                 notifyPlayback();
-                main.postDelayed(() -> next(true), 400);
+                if (onError != null) main.postDelayed(onError, 300);
+                else main.postDelayed(() -> next(true), 400);
                 return true;
             });
             mp.prepareAsync();
             player = mp;
         } catch (Exception e) {
             loading = false;
-            Log.w(TAG, "cannot open " + t.localUri, e);
+            Log.w(TAG, "cannot open " + uri, e);
+            if (onError != null) main.post(onError);
         }
         notifyPlayback();
+    }
+
+    /**
+     * Resolves a stream url off the main thread, then opens it.
+     *
+     * Resolution is a yt-dlp run (a second or two), so it can never happen on the main
+     * thread. The token makes a result that arrives after the user has moved on a no-op
+     * instead of starting a song they skipped.
+     */
+    private void resolveAndOpen(Track t) {
+        final int token = ++loadToken;
+        resolvingStream = true;
+        loading = true;
+        notifyPlayback();
+        resolver.execute(() -> {
+            String url = "";
+            String error = "";
+            try {
+                url = DownloadEngine.resolveStream(app, t, null);
+            } catch (Throwable e) {
+                String m = e.getMessage();
+                error = m == null || m.trim().isEmpty() ? "Could not stream this track" : m;
+            }
+            final String resolved = url;
+            final String failure = error;
+            main.post(() -> {
+                if (token != loadToken) return;
+                resolvingStream = false;
+                loading = false;
+                if (current() != t) return;
+                if (resolved.isEmpty()) {
+                    t.error = failure;
+                    Log.w(TAG, "stream failed for " + t.title + ": " + failure);
+                    notifyPlayback();
+                    return;
+                }
+                t.streamUrl = resolved;
+                open(resolved, t, () -> {
+                    t.streamUrl = "";
+                    t.error = "Stream expired";
+                    notifyPlayback();
+                });
+            });
+        });
     }
 
     private void onComplete() {
@@ -277,6 +419,14 @@ public final class Playback {
      * so the button never throws and never appears to do nothing.
      */
     public void toggle() {
+        if (player == null && resolvingStream) {
+            // The url is still being resolved. Restarting the load here would throw the
+            // in-flight resolution away and start a second one, so the tap only records
+            // the intent and the prepared listener applies it.
+            playWhenReady = !playWhenReady;
+            notifyPlayback();
+            return;
+        }
         if (player == null || loading) {
             if (player == null) {
                 playAt(index < 0 ? 0 : index, true);
@@ -288,7 +438,7 @@ public final class Playback {
         }
         try {
             if (player.isPlaying()) {
-                player.pause();
+                fadeOutAndPause();
                 playWhenReady = false;
                 abandonFocus();
             } else {
@@ -298,6 +448,7 @@ public final class Playback {
                     Log.w(TAG, "audio focus refused");
                 }
                 player.start();
+                fadeIn();
                 playWhenReady = true;
                 ensureService();
             }
@@ -308,9 +459,95 @@ public final class Playback {
         notifyPlayback();
     }
 
+    /**
+     * A short volume ramp on start and stop.
+     *
+     * MediaPlayer applies start() and pause() instantly, so a tap produced a hard edge: the
+     * music simply appeared and simply vanished. Nothing else in the app snaps like that,
+     * and a 180 ms ramp is enough for the ear to read it as the music rising and settling
+     * instead of being switched. It is deliberately short: this is a player, not a fader.
+     */
+    private static final long FADE_MS = 180L;
+
+    private android.animation.ValueAnimator fade;
+
+    /** Ramps 0 -> 1 so a started track swells in instead of clicking on. */
+    private void fadeIn() {
+        cancelFade();
+        if (player == null) return;
+        fade = android.animation.ValueAnimator.ofFloat(0f, 1f);
+        fade.setDuration(FADE_MS);
+        fade.addUpdateListener(a -> {
+            try {
+                if (player != null) player.setVolume((float) a.getAnimatedValue(),
+                        (float) a.getAnimatedValue());
+            } catch (IllegalStateException ignored) {
+            }
+        });
+        fade.start();
+    }
+
+    /**
+     * Ramps 1 -> 0 and pauses at the end, then restores full volume.
+     *
+     * The volume has to be put back after the pause: leaving it at zero would mean the next
+     * start() played silently, and the duck path (which sets 0.2) would then ramp from the
+     * wrong base.
+     */
+    private void fadeOutAndPause() {
+        cancelFade();
+        if (player == null) {
+            return;
+        }
+        final MediaPlayer target = player;
+        fade = android.animation.ValueAnimator.ofFloat(1f, 0f);
+        fade.setDuration(FADE_MS);
+        fade.addUpdateListener(a -> {
+            try {
+                target.setVolume((float) a.getAnimatedValue(), (float) a.getAnimatedValue());
+            } catch (IllegalStateException ignored) {
+            }
+        });
+        fade.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(android.animation.Animator animation) {
+                try {
+                    if (target.isPlaying()) target.pause();
+                    target.setVolume(1f, 1f);
+                } catch (IllegalStateException ignored) {
+                }
+            }
+        });
+        fade.start();
+    }
+
+    private void cancelFade() {
+        if (fade != null) {
+            fade.cancel();
+            fade = null;
+        }
+    }
+
     /** True while the current file is still being prepared. */
     public boolean isLoading() {
         return loading;
+    }
+
+    /**
+     * True while the current track is waiting on its stream url.
+     *
+     * Distinguished from a file load because the two take very different times: a file
+     * is ready in milliseconds, a stream takes a second or two, and the player says
+     * "Buffering" for one and "Connecting" for the other.
+     */
+    public boolean isResolvingStream() {
+        return resolvingStream;
+    }
+
+    /** True when the current track is played from the network, not from a saved file. */
+    public boolean isStream() {
+        Track t = current();
+        return t != null && t.localUri.isEmpty() && !t.streamUrl.isEmpty();
     }
 
     /** Whether the current track is meant to be playing, even mid-load. */
@@ -320,7 +557,9 @@ public final class Playback {
 
     public void pause() {
         if (player != null && isPlaying()) {
-            player.pause();
+            // Same ramp as the play button: a notification or an auto-pause should not
+            // sound different from a tap.
+            fadeOutAndPause();
             pausedByFocus = false;
             notifyPlayback();
         }
@@ -622,13 +861,26 @@ public final class Playback {
     private void ensureService() {
         try {
             Intent i = new Intent(app, PlaybackService.class).setAction(PlaybackService.ACTION_SYNC);
-            app.startForegroundService(i);
+            // Context#startForegroundService is API 26+. This app supports API 24, so the
+            // raw call threw NoSuchMethodError on Android 7 - and the catch below only
+            // handles Exception, not Error, so it crashed the app on the first play tap.
+            // ContextCompat routes to startService on older releases, which is the correct
+            // behaviour there: the service simply is not required to go foreground.
+            androidx.core.content.ContextCompat.startForegroundService(app, i);
         } catch (Exception e) {
             Log.w(TAG, "cannot start playback service", e);
+        } catch (Throwable t) {
+            // Belt and braces: never let a service-start failure take down playback.
+            Log.w(TAG, "cannot start playback service", t);
         }
     }
 
     private void release() {
+        // Any resolution still in flight belongs to the previous track: bumping the
+        // token makes its result a no-op, so leaving a song cannot start it a second
+        // later from a worker thread.
+        loadToken++;
+        resolvingStream = false;
         if (player != null) {
             try {
                 player.reset();

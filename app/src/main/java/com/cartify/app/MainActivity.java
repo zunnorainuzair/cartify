@@ -1,6 +1,9 @@
 package com.cartify.app;
 
 import android.Manifest;
+import android.animation.AnimatorSet;
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -17,7 +20,6 @@ import android.view.View;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
-import android.widget.HorizontalScrollView;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -63,17 +65,26 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     private ImageButton clearButton;
     private Button resolveButton;
     private TextView statusText;
-    private LinearLayout collectionBar;
-    private ImageView collectionCover;
-    private TextView collectionName;
-    private TextView collectionMeta;
-    private Button downloadAllButton;
     private RecyclerView list;
     private RecyclerView recRail;
     private CardAdapter cardAdapter;
+    private PlaylistResultAdapter playlistRailAdapter;
+    private TextView playlistHeader;
+    private androidx.recyclerview.widget.RecyclerView playlistRail;
+    /** Last playlist search result, kept so opening one does not re-hit the network. */
+    private final java.util.List<PlaylistResult> playlistResults = new java.util.ArrayList<>();
     private TextView recHeader;
-    private HorizontalScrollView recentRow;
-    private LinearLayout recentChips;
+    /**
+     * The header + rail as one unit, revealed by scrolling the results.
+     *
+     * The shelf used to be always visible and always at the top, so on a search the first
+     * thing the user saw was a rail of other songs and the rows they actually searched for
+     * started below the fold. It now stays out of the way until the list is scrolled, and
+     * then fades in together with its label.
+     */
+    private View shelfBlock;
+    /** True when the current collection has a shelf worth showing. */
+    private boolean shelfAvailable;
     private LinearLayout emptyState;
 
     private LinearLayout homeView;
@@ -165,7 +176,15 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     private Playback playback;
 
     /** The launch animation runs once per process, not on every return from the player. */
-    private static boolean SPLASH_SHOWN = false;
+    /**
+     * Whether the intro has already played for the current foreground session.
+     *
+     * This used to be a process-wide latch set once and never cleared, so the
+     * animation played exactly once per process and never again - reopening the app
+     * from Recents, or returning after it had been in the background, showed no
+     * intro at all. It is now reset whenever the app leaves the foreground.
+     */
+    private boolean splashShown;
     /** Unused placeholder kept for source compatibility. */
     private SplashView splash;
 
@@ -216,9 +235,8 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         refreshLibrary();
         renderMini();
         main.post(miniTicker);
-        playIntro();
+        // playIntro() is driven from onStart, which also runs on a cold launch.
         checkForUpdates();
-        renderRecentSearches();
         showGreeting();
         // Recently played first, chart only as a fallback. Both fill the same rows
         // and whichever runs first wins, so this order is the decision.
@@ -226,6 +244,20 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     }
 
     // ---------------------------------------------------------------- updates
+
+    /** The release the banner is offering; null when nothing is pending. */
+    private Updater.Release pendingUpdate;
+    /** The APK once it has landed, so the banner can install it without a re-download. */
+    private java.io.File downloadedUpdate;
+    private boolean updateDownloading;
+    /** True while the system install-unknown-apps page is open on our behalf. */
+    private boolean awaitingInstallPermission;
+    private View updateBanner;
+    private TextView updateBannerTitle;
+    private TextView updateBannerSub;
+    private TextView updateBannerAction;
+    /** The pulsing dot on the banner; cancelled when the banner hides. */
+    private AnimatorSet updatePulse;
 
     /**
      * Looks for a newer GitHub release and offers it.
@@ -236,8 +268,25 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     private void checkForUpdates() {
         Updater.check(this, false, release -> {
             if (release == null || isFinishing()) return;
+            // An APK that already finished downloading is worth surfacing even if the
+            // user dismissed the banner earlier: the bytes are on disk and the only
+            // thing left is the install.
+            java.io.File ready = Updater.downloadedApk(this, release.tag);
+            if (ready != null) {
+                pendingUpdate = release;
+                downloadedUpdate = ready;
+                showUpdateBanner(release);
+                if (updateBannerTitle != null) {
+                    updateBannerTitle.setText("Update ready \u00b7 " + release.tag);
+                }
+                if (updateBannerSub != null) {
+                    updateBannerSub.setText("Downloaded \u2014 tap to install");
+                }
+                if (updateBannerAction != null) updateBannerAction.setText("Install");
+                return;
+            }
             if (Updater.alreadyOffered(this, release.tag)) return;
-            showUpdateSheet(release);
+            showUpdateBanner(release);
         });
     }
 
@@ -374,50 +423,294 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
      */
     private void checkForUpdatesManually() {
         toast("Checking for updates\u2026");
-        Updater.check(this, true, release -> {
+        Updater.checkWithStatus(this, true, (release, status) -> {
             if (isFinishing()) return;
-            if (release == null) {
-                toast("Cartify is up to date");
-            } else {
-                // A manual check ignores the \"already offered\" flag: asking again is a
+            if (release != null) {
+                // A manual check ignores the "already offered" flag: asking again is a
                 // request to see it again.
                 showUpdateSheet(release);
+                return;
+            }
+            // Silence after an explicit tap reads as a broken button, so every outcome
+            // says something. The automatic check stays quiet; this one does not.
+            switch (status) {
+                case OFFLINE:
+                    toast("No connection \u2014 could not reach GitHub");
+                    break;
+                case UNAVAILABLE:
+                    toast("GitHub is not answering right now \u2014 try again later");
+                    break;
+                default:
+                    toast("Cartify " + Updater.appVersionName(this) + " is up to date");
+                    break;
             }
         });
     }
 
     /** Builds the "update available" sheet with the release notes and a download button. */
     private void showUpdateSheet(final Updater.Release release) {
-        String notes = release.notes == null ? "" : release.notes.trim();
-        if (notes.length() > 300) notes = notes.substring(0, 300).trim() + "\u2026";
-        String subtitle = notes.isEmpty()
-                ? "A newer version is available."
-                : notes;
+        // The notes are markdown on GitHub; shown raw they put literal "##" and "**"
+        // around every line, so they are flattened first.
+        String notes = Updater.plainNotes(release.notes);
+        if (notes.length() > 600) notes = notes.substring(0, 600).trim() + "\u2026";
+        String installed = "Installed " + Updater.appVersionName(this);
+        String subtitle = installed + "  \u00b7  " + release.summary()
+                + (notes.isEmpty() ? "" : "\n\n" + notes);
         MenuSheet.show(this, "Update available \u00b7 " + release.tag, subtitle,
                 new MenuSheet.Item(R.drawable.ic_download, "Download and install",
-                        () -> downloadUpdate(release)),
+                        () -> startUpdate(release)),
                 new MenuSheet.Item(R.drawable.ic_close, "Later",
                         () -> Updater.markOffered(this, release.tag)));
     }
 
-    /** Downloads the release APK, showing progress in the status line, then installs it. */
+    // ------------------------------------------------------------------ update banner
+
+    /**
+     * Wires the update banner that sits above every tab.
+     *
+     * The banner is the whole point of this screen's update path: the sheet it replaces was
+     * only reachable from a menu, so a release that landed while the app was closed was
+     * invisible unless the user went looking for it.
+     */
+    private void bindUpdateBanner() {
+        updateBanner = findViewById(R.id.updateBanner);
+        if (updateBanner == null) return;
+        updateBannerTitle = findViewById(R.id.updateBannerTitle);
+        updateBannerSub = findViewById(R.id.updateBannerSub);
+        updateBannerAction = findViewById(R.id.updateBannerAction);
+        updateBanner.setOnClickListener(v -> onUpdateBannerTapped());
+        if (updateBannerAction != null) {
+            updateBannerAction.setOnClickListener(v -> onUpdateBannerTapped());
+        }
+        View close = findViewById(R.id.updateBannerClose);
+        if (close != null) close.setOnClickListener(v -> dismissUpdateBanner());
+    }
+
+    /** Shows the banner for a release, sliding it down from the top edge. */
+    private void showUpdateBanner(final Updater.Release release) {
+        if (updateBanner == null || release == null || isFinishing()) return;
+        pendingUpdate = release;
+        updateBannerTitle.setText("Update available \u00b7 " + release.tag);
+        String notes = Updater.plainNotes(release.notes);
+        int cut = notes.indexOf('\n');
+        if (cut > 0) notes = notes.substring(0, cut).trim();
+        if (notes.length() > 70) notes = notes.substring(0, 70).trim() + "\u2026";
+        // The size is the one fact a user wants before starting a download on mobile
+        // data, so it is shown even when the release has no notes.
+        String size = Updater.formatSize(release.size);
+        if (notes.isEmpty()) {
+            updateBannerSub.setText(size.isEmpty() ? "Tap to update" : size + "  \u00b7  Tap to update");
+        } else {
+            updateBannerSub.setText(size.isEmpty() ? notes : notes + "  \u00b7  " + size);
+        }
+        updateBannerAction.setText("Update");
+
+        if (updateBanner.getVisibility() != View.VISIBLE) {
+            updateBanner.setVisibility(View.VISIBLE);
+            updateBanner.setAlpha(0f);
+            updateBanner.setTranslationY(-20f * getResources().getDisplayMetrics().density);
+            updateBanner.animate().alpha(1f).translationY(0f)
+                    .setDuration(260)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                    .start();
+        }
+        startUpdatePulse();
+    }
+
+    /** Hides the banner and remembers the dismissal for this release only. */
+    private void dismissUpdateBanner() {
+        if (updateBanner == null) return;
+        stopUpdatePulse();
+        if (pendingUpdate != null && !updateDownloading) {
+            Updater.markOffered(this, pendingUpdate.tag);
+        }
+        updateBanner.animate().alpha(0f).translationY(-20f * getResources().getDisplayMetrics().density)
+                .setDuration(180)
+                .withEndAction(() -> {
+                    if (updateBanner == null) return;
+                    updateBanner.setVisibility(View.GONE);
+                    updateBanner.setAlpha(1f);
+                    updateBanner.setTranslationY(0f);
+                })
+                .start();
+    }
+
+    /**
+     * Pulses the banner dot.
+     *
+     * A static badge is easy to read past on a screen that already has a progress bar and a
+     * mini player animating on it; a slow breath on the dot is what makes it register as
+     * "something is waiting for you".
+     */
+    private void startUpdatePulse() {
+        View dot = findViewById(R.id.updateDot);
+        if (dot == null) return;
+        stopUpdatePulse();
+        ObjectAnimator fade = ObjectAnimator.ofFloat(dot, View.ALPHA, 1f, 0.25f);
+        ObjectAnimator grow = ObjectAnimator.ofFloat(dot, View.SCALE_X, 1f, 1.6f);
+        ObjectAnimator growY = ObjectAnimator.ofFloat(dot, View.SCALE_Y, 1f, 1.6f);
+        for (ObjectAnimator a : new ObjectAnimator[]{fade, grow, growY}) {
+            a.setDuration(850);
+            a.setRepeatCount(ValueAnimator.INFINITE);
+            a.setRepeatMode(ValueAnimator.REVERSE);
+            a.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
+        }
+        updatePulse = new AnimatorSet();
+        updatePulse.playTogether(fade, grow, growY);
+        updatePulse.start();
+    }
+
+    private void stopUpdatePulse() {
+        if (updatePulse != null) {
+            updatePulse.cancel();
+            updatePulse = null;
+        }
+        View dot = findViewById(R.id.updateDot);
+        if (dot != null) {
+            dot.setAlpha(1f);
+            dot.setScaleX(1f);
+            dot.setScaleY(1f);
+        }
+    }
+
+    /** A tap anywhere on the banner either installs what has landed or asks to start. */
+    private void onUpdateBannerTapped() {
+        if (downloadedUpdate != null && downloadedUpdate.exists()) {
+            if (!Updater.install(this, downloadedUpdate)) {
+                awaitingInstallPermission = true;
+            }
+            return;
+        }
+        if (updateDownloading) {
+            // A download that cannot be stopped is a download the user cannot get out
+            // of; the partial file survives, so cancelling costs nothing.
+            MenuSheet.show(this, "Downloading update",
+                    "The download continues in the background. Cancelling keeps what has "
+                            + "already arrived, so tapping Update again resumes it.",
+                    new MenuSheet.Item(R.drawable.ic_close, "Cancel download", () -> {
+                        Updater.cancelDownload();
+                        toast("Update cancelled");
+                    }),
+                    new MenuSheet.Item(R.drawable.ic_download, "Keep downloading", () -> {
+                    }));
+            return;
+        }
+        confirmUpdate();
+    }
+
+    /**
+     * Asks before doing anything irreversible.
+     *
+     * The download and the install both run without further taps, but the consent to let
+     * the app replace itself is the user's to give, so it is asked once here in the app's
+     * own sheet rather than as a surprise system dialog.
+     */
+    private void confirmUpdate() {
+        if (pendingUpdate == null) {
+            checkForUpdatesManually();
+            return;
+        }
+        final Updater.Release release = pendingUpdate;
+        MenuSheet.show(this, "Update to " + release.tag,
+                "Cartify downloads the update in the background and installs it. "
+                        + "Android asks once for permission to install.",
+                new MenuSheet.Item(R.drawable.ic_download, "Allow and update",
+                        () -> startUpdate(release)),
+                new MenuSheet.Item(R.drawable.ic_close, "Not now", () -> {
+                }));
+    }
+
+    /**
+     * Starts the background update, asking for install permission first.
+     *
+     * Android 8+ will not let the app hand an APK to the installer until the user allows
+     * that app to install unknown apps. Asking up front means the download is not wasted
+     * behind a dialog the user then cancels.
+     */
+    private void startUpdate(final Updater.Release release) {
+        if (release == null || isFinishing()) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && !getPackageManager().canRequestPackageInstalls()) {
+            awaitingInstallPermission = true;
+            toast("Allow Cartify to install apps, then the update continues");
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Exception e) {
+                awaitingInstallPermission = false;
+                toast("Could not open the install settings");
+            }
+            return;
+        }
+        awaitingInstallPermission = false;
+        downloadUpdate(release);
+    }
+
+    /** Downloads the release APK in the background, driving the banner, then installs it. */
     private void downloadUpdate(final Updater.Release release) {
-        Updater.markOffered(this, release.tag);
+        if (release == null || isFinishing()) return;
+        updateDownloading = true;
+        downloadedUpdate = null;
+        if (updateBanner != null) {
+            updateBannerTitle.setText("Downloading update \u00b7 " + release.tag);
+            updateBannerSub.setText("Starting\u2026");
+            updateBannerAction.setText("0%");
+        }
         statusText.setText("Downloading update\u2026");
         Updater.download(this, release, new Updater.DownloadCallback() {
             @Override
             public void onProgress(int percent) {
+                if (isFinishing()) return;
+                if (updateBanner != null) {
+                    updateBannerSub.setText("Downloading in the background\u2026");
+                    updateBannerAction.setText(percent + "%");
+                }
                 statusText.setText("Downloading update\u2026 " + percent + "%");
             }
 
             @Override
             public void onReady(java.io.File apk) {
+                updateDownloading = false;
+                downloadedUpdate = apk;
+                if (isFinishing()) return;
+                if (updateBanner != null) {
+                    updateBannerTitle.setText("Update ready \u00b7 " + release.tag);
+                    updateBannerSub.setText("Installing\u2026");
+                    updateBannerAction.setText("Install");
+                }
                 statusText.setText("Update downloaded");
-                Updater.install(MainActivity.this, apk);
+                // Straight to the installer: no second tap between download and install.
+                // If the install permission is still missing, install() opens the settings
+                // page and returns false; onResume then installs this same file instead of
+                // downloading it again.
+                if (!Updater.install(MainActivity.this, apk)) {
+                    awaitingInstallPermission = true;
+                    if (updateBanner != null) {
+                        updateBannerSub.setText("Allow installs, then tap Install");
+                    }
+                }
             }
 
             @Override
             public void onFailed(String message) {
+                updateDownloading = false;
+                if (isFinishing()) return;
+                if ("cancelled".equals(message)) {
+                    // A cancel is not a failure: the partial file is kept, so the next
+                    // attempt resumes from where this one stopped.
+                    if (updateBanner != null) {
+                        updateBannerTitle.setText("Update available \u00b7 " + release.tag);
+                        updateBannerSub.setText("Download cancelled \u2014 tap to resume");
+                        updateBannerAction.setText("Update");
+                    }
+                    statusText.setText("Update cancelled");
+                    return;
+                }
+                if (updateBanner != null) {
+                    updateBannerTitle.setText("Update failed");
+                    updateBannerSub.setText(message == null ? "Tap to retry" : message);
+                    updateBannerAction.setText("Retry");
+                }
                 statusText.setText("Update failed: " + message);
                 toast("Could not download the update");
             }
@@ -433,11 +726,20 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     private void playIntro() {
         splash = findViewById(R.id.splash);
         if (splash == null) return;
-        if (SPLASH_SHOWN) {
+        if (splashShown) {
             splash.setVisibility(View.GONE);
             return;
         }
-        SPLASH_SHOWN = true;
+        splashShown = true;
+        // The intro is a full-bleed black beat, matching the black field of the logo
+        // itself. The window normally wears the surface green, so both system bars are
+        // held black for the duration and handed back in onFinished.
+        getWindow().setStatusBarColor(0xFF000000);
+        getWindow().setNavigationBarColor(0xFF000000);
+        // Always from frame zero: a replay must not resume wherever the last run stopped.
+        splash.reset();
+        splash.setVisibility(View.VISIBLE);
+        splash.setAlpha(1f);
         // The intro is a visual beat only; no startup sound is played.
         splash.setListener(new SplashView.Listener() {
             @Override
@@ -453,6 +755,12 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
                         .setDuration(320)
                         .withEndAction(() -> {
                             splash.setVisibility(View.GONE);
+
+                            // The bars return to the theme colour now the black beat is over.
+                            getWindow().setStatusBarColor(
+                                    getResources().getColor(R.color.surface));
+                            getWindow().setNavigationBarColor(
+                                    getResources().getColor(R.color.surface));
 
                             // The content settles in as the splash lifts, so the
                             // transition reads as one motion rather than a cut.
@@ -476,18 +784,15 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     }
 
     private void bindViews() {
+        bindUpdateBanner();
         linkInput = findViewById(R.id.linkInput);
         clearButton = findViewById(R.id.clearButton);
         resolveButton = findViewById(R.id.resolveButton);
         statusText = findViewById(R.id.statusText);
-        collectionBar = findViewById(R.id.collectionBar);
-        collectionCover = findViewById(R.id.collectionCover);
-        collectionName = findViewById(R.id.collectionName);
-        collectionMeta = findViewById(R.id.collectionMeta);
-        downloadAllButton = findViewById(R.id.downloadAllButton);
         list = findViewById(R.id.list);
         recRail = findViewById(R.id.recRail);
         recHeader = findViewById(R.id.recHeader);
+        shelfBlock = findViewById(R.id.shelfBlock);
         if (recRail != null) {
             // A horizontal rail needs a horizontal layout manager; the default vertical one
             // would stack the cards down the page and break the shelf entirely.
@@ -498,9 +803,59 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
                 startDownload(one);
             });
             recRail.setAdapter(cardAdapter);
-        recentRow = findViewById(R.id.recentRow);
-        recentChips = findViewById(R.id.recentChips);
         }
+        playlistRail = findViewById(R.id.playlistRail);
+        playlistHeader = findViewById(R.id.playlistHeader);
+        if (playlistRail != null) {
+            playlistRail.setLayoutManager(new LinearLayoutManager(this,
+                    LinearLayoutManager.HORIZONTAL, false));
+            playlistRailAdapter = new PlaylistResultAdapter(new PlaylistResultAdapter.Actions() {
+                @Override
+                public void onOpen(PlaylistResult playlist) {
+                    openPlaylist(playlist);
+                }
+
+                @Override
+                public void onDownload(PlaylistResult playlist) {
+                    downloadPlaylist(playlist);
+                }
+            });
+            playlistRail.setAdapter(playlistRailAdapter);
+        }
+        // These two used to be bound INSIDE the recRail null-check above, so a layout
+        // without the rail would have left them null and every later use would have thrown.
+        // The shelf is a sibling ABOVE the results list, which is weighted to fill the rest
+        // of the pane. That means every pixel of shelf is a pixel taken away from the list:
+        // once it appeared, it squeezed the rows the user was reading and they had to keep
+        // scrolling inside a shrunken window.
+        //
+        // It is now a "peek" that gets out of the way. Scrolling down folds it away and the
+        // list immediately reclaims the full height; scrolling back to the top brings it
+        // back. Collapsing (height -> 0) is used rather than alpha, because alpha hides a
+        // view while it keeps occupying its layout slot, which is exactly the problem.
+        // The shelf fades away continuously with the scroll, from the very first pixel.
+        //
+        // Two earlier attempts are worth knowing about, because both failed for the same
+        // reason and neither is what is here now:
+        //   1. toggling a block's height in onScrolled() - the height change altered whether
+        //      the list could scroll up, which fired another callback with the opposite
+        //      direction, which toggled it back. A held finger oscillated it many times a
+        //      second and the pane strobed.
+        //   2. doing the same decision only on SCROLL_STATE_IDLE - no oscillation, but it
+        //      meant nothing happened until the finger lifted, so it could only pop in and
+        //      out, and it took a full screen of scrolling to trigger at all.
+        //
+        // What is here now reacts to scroll POSITION, not to direction or to state changes.
+        // The shelf's alpha, its offset and the list's top padding are all one monotonic
+        // function of how far the list has been scrolled, so scrolling back up unwinds it
+        // exactly and no feedback loop is possible: nothing here depends on which way the
+        // finger is moving, only on where the list is.
+        list.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(@NonNull RecyclerView rv, int dx, int dy) {
+                applyShelfFade(rv.computeVerticalScrollOffset());
+            }
+        });
         emptyState = findViewById(R.id.emptyState);
 
         homeView = findViewById(R.id.homeView);
@@ -599,7 +954,23 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         final EditText searchInput = findViewById(R.id.searchInput);
         View searchGo = findViewById(R.id.searchGo);
         if (searchGo != null) searchGo.setOnClickListener(v -> runSearch(searchInput));
+        // The clear affordance appears only once there is a query to clear, so the field
+        // does not carry a dead control on an empty box.
+        final View searchClear = findViewById(R.id.searchClear);
+        if (searchClear != null) {
+            searchClear.setOnClickListener(v -> {
+                if (searchInput == null) return;
+                searchInput.setText("");
+                searchClear.animate().alpha(0f).setDuration(120).start();
+            });
+        }
         if (searchInput != null) {
+            searchInput.addTextChangedListener(new SimpleWatcher(hasText -> {
+                if (searchClear == null) return;
+                searchClear.animate().cancel();
+                searchClear.setAlpha(1f);
+                searchClear.setVisibility(hasText ? View.VISIBLE : View.GONE);
+            }));
             searchInput.setOnEditorActionListener((v, actionId, event) -> {
                 if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) {
                     runSearch(searchInput);
@@ -608,13 +979,15 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
                 return false;
             });
         }
-        downloadAllButton.setOnClickListener(v -> {
-            if (collection != null) startDownload(collection.tracks);
-        });
 
         navHome.setOnClickListener(v -> showTab(TAB_HOME));
         navLibrary.setOnClickListener(v -> showTab(TAB_LIBRARY));
         navPlaylists.setOnClickListener(v -> showTab(TAB_PLAYLISTS));
+        // The bar must agree with the pane on the FIRST frame, not after the first
+        // tap. activeTab starts as TAB_HOME, so without this the bar shows whatever
+        // the XML says - which is how the oval sat under Offline while the search
+        // pane was the one on screen.
+        syncNav();
         navDownloads.setOnClickListener(v -> showTab(TAB_DOWNLOADS));
         if (downloadsClear != null) downloadsClear.setOnClickListener(v -> clearFailedDownloads());
         findViewById(R.id.newPlaylistButton).setOnClickListener(v -> createPlaylist());
@@ -634,6 +1007,29 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         findViewById(R.id.miniPrev).setOnClickListener(v -> playback.previous());
         findViewById(R.id.miniNext).setOnClickListener(v -> playback.next(false));
         findViewById(R.id.miniMore).setOnClickListener(this::showMiniMenu);
+        // Saving the song that is playing, straight from the collapsed bar. It is the
+        // same call the player's overflow makes, so a stream can be kept without
+        // leaving the list or interrupting playback.
+        findViewById(R.id.miniDownload).setOnClickListener(v -> downloadCurrentTrack());
+    }
+
+    /**
+     * Queues the currently playing track for download.
+     *
+     * Deliberately does nothing to playback: the point is that the song keeps playing
+     * from the network while its file is fetched, and the next time it starts it opens
+     * from disk. Rows that already have a file are a no-op rather than an error.
+     */
+    private void downloadCurrentTrack() {
+        Track t = playback.current();
+        if (t == null) return;
+        if (t.localUri != null && !t.localUri.isEmpty()) {
+            toast("Already saved to your device");
+            return;
+        }
+        boolean started = DownloadState.download(this, t,
+                playback.source().isEmpty() ? "Cartify" : playback.source());
+        if (started) renderMini();
     }
 
     private void setupLists() {
@@ -651,6 +1047,11 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
             @Override
             public void onPlayClicked(Track track, int index) {
                 playFromList(index);
+            }
+
+            @Override
+            public void onStreamClicked(Track track, int index) {
+                streamFromList(index);
             }
         });
         list.setLayoutManager(new LinearLayoutManager(this));
@@ -731,6 +1132,7 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     /** Library opens first: the songs you already own matter more than the paste box. */
     private int activeTab = TAB_HOME;
 
+
     /**
      * Back leaves selection mode before it leaves the screen.
      *
@@ -756,6 +1158,18 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
                 });
     }
 
+    /**
+     * Tells a screen reader which tab just opened.
+     *
+     * The pill, the tint and the label weight all change on a tab switch, but none of that
+     * is audible: to TalkBack the screen simply replaced its contents with no explanation.
+     * Announcing the pane name is the smallest thing that makes the bar usable without sight.
+     */
+    private void announceTab(String name) {
+        View root = findViewById(android.R.id.content);
+        if (root != null) root.announceForAccessibility(name + " tab");
+    }
+
     private void showTab(int tab) {
         rememberScroll();
         // Selection belongs to the library view; switching tabs drops it.
@@ -764,14 +1178,17 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         }
         if (tab == TAB_PLAYLISTS) {
             showPlaylistsTab();
+            announceTab("Playlists");
             return;
         }
         if (tab == TAB_DOWNLOADS) {
             showDownloadsTab();
+            announceTab("Downloads");
             return;
         }
         activeTab = tab;
         boolean library = tab == TAB_LIBRARY;
+        announceTab(library ? "Offline" : "Search");
         if (playlistsView != null) playlistsView.setVisibility(View.GONE);
         if (downloadsView != null) downloadsView.setVisibility(View.GONE);
         View incoming = library ? libraryView : homeView;
@@ -882,7 +1299,7 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         playlistsView.setVisibility(View.VISIBLE);
         playlistsView.setAlpha(0f);
         playlistsView.setTranslationY(12f * getResources().getDisplayMetrics().density);
-        playlistsView.animate().alpha(1f).translationY(0f).setDuration(220)
+        playlistsView.animate().alpha(1f).translationY(0f).setDuration(200)
                 .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
         refreshPlaylists();
         syncNav();
@@ -904,7 +1321,7 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         downloadsView.setVisibility(View.VISIBLE);
         downloadsView.setAlpha(0f);
         downloadsView.setTranslationY(12f * getResources().getDisplayMetrics().density);
-        downloadsView.animate().alpha(1f).translationY(0f).setDuration(220)
+        downloadsView.animate().alpha(1f).translationY(0f).setDuration(200)
                 .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
         refreshDownloads();
         restoreScroll(TAB_DOWNLOADS);
@@ -977,21 +1394,38 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         toast("Cancelled " + (track.title == null ? "track" : track.title));
     }
 
-    /** Plays from the downloads list, which only holds rows with a local file at most. */
+    /**
+     * Plays a row from the Downloads page.
+     *
+     * The page only holds queued, running and failed rows, so a row that has finished is
+     * not on it and the rows that are on it usually have no local file yet. The old code
+     * looked only at those rows, found nothing playable, and answered every tap with
+     * "Not downloaded yet" — even for a song that was already saved. It now falls back to
+     * the library by title + artist, which is the same lookup the importer uses.
+     */
     private void playDownloadsFrom(int index) {
         List<Track> items = downloadsAdapter.items();
         if (index < 0 || index >= items.size()) return;
+        Track tapped = items.get(index);
+        if (tapped.localUri == null || tapped.localUri.isEmpty()) {
+            LibraryStore.Item saved = LibraryStore.findSaved(this, tapped.title, tapped.artist);
+            if (saved == null) {
+                toast("Not downloaded yet");
+                return;
+            }
+            tapped.localUri = saved.uri;
+        }
         List<Track> ready = new ArrayList<>();
         int start = -1;
         for (Track t : items) {
             if (t.localUri != null && !t.localUri.isEmpty()) {
-                if (t == items.get(index)) start = ready.size();
+                if (t == tapped) start = ready.size();
                 ready.add(t);
             }
         }
         if (start < 0) {
-            toast("Not downloaded yet");
-            return;
+            ready.add(tapped);
+            start = 0;
         }
         playback.playQueue(ready, start, "Cartify");
         openPlayer();
@@ -1130,45 +1564,6 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
      * tap a search result uses. Loaded once per launch and only when the list is empty, so
      * it never overwrites something the user just searched for.
      */
-    /**
-     * Shows the stored searches as tappable chips under the search box.
-     *
-     * Rebuilt from scratch each time: the list is at most eight entries, so recycling
-     * views would cost more code than it saves.
-     */
-    private void renderRecentSearches() {
-        if (recentRow == null || recentChips == null) return;
-        recentChips.removeAllViews();
-        List<String> terms = SearchHistory.all(this);
-        if (terms.isEmpty()) {
-            recentRow.setVisibility(View.GONE);
-            return;
-        }
-        recentRow.setVisibility(View.VISIBLE);
-        float d = getResources().getDisplayMetrics().density;
-        for (String term : terms) {
-            TextView chip = new TextView(this);
-            chip.setText(term);
-            chip.setTextSize(12f);
-            chip.setTextColor(getColor(R.color.text_primary));
-            chip.setBackgroundResource(R.drawable.bg_chip);
-            int padH = (int) (12 * d), padV = (int) (7 * d);
-            chip.setPadding(padH, padV, padH, padV);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT);
-            lp.rightMargin = (int) (8 * d);
-            chip.setLayoutParams(lp);
-            chip.setOnClickListener(v -> {
-                EditText box = findViewById(R.id.searchInput);
-                if (box == null) return;
-                box.setText(term);
-                box.setSelection(box.getText().length());
-                runSearch(box);
-            });
-            recentChips.addView(chip);
-        }
-    }
 
     /** Greets by the phone's own clock, the way Spotify's home screen does. */
     private void showGreeting() {
@@ -1193,6 +1588,183 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
      * appeared to overlap them. Collapsing the card the first time a list arrives gives the
      * rows the whole screen, and the search box above stays put.
      */
+    /**
+     * Folds the "More like this" shelf away, giving its height back to the results list.
+     *
+     * The shelf sits above the list in a vertical stack, so while it is open it physically
+     * shrinks the rows underneath: the user sees fewer songs and has to scroll inside a
+     * smaller window to read them. Animating the block's height to zero returns that space
+     * to the list in the same frames as the fold, so the rows visibly move up instead of
+     * being revealed only after a jump.
+     *
+     * Guarded by {@link #shelfOpen}: a scroll listener fires for every pixel, and starting
+     * the animation again on each tick would make the fold stutter and never settle.
+     */
+    /**
+     * How far the shelf has faded, 0 = fully visible, 1 = fully gone.
+     *
+     * Set from scroll position only, never from direction, which is what makes it stable.
+     */
+    private float shelfFade;
+    /** Measured height of the shelf, used for the list padding and the travel distance. */
+    private int shelfHeightPx;
+
+    /**
+     * Fades the shelf out and slides it up as the results are scrolled.
+     *
+     * @param scrollY the list's vertical scroll offset in pixels.
+     *
+     * The whole effect is a pure function of {@code scrollY}:
+     *   - alpha 1 -> 0 over the first {@link #SHELF_FADE_PX}
+     *   - translationY 0 -> -height over the same distance
+     *   - the list's top padding shrinks by the same amount, so the rows rise into the
+     *     space instead of sitting under a gap
+     *
+     * Nothing is animated and no layout is requested: transforms and a padding update are
+     * cheap, they cannot fire scroll callbacks, and scrolling back up recomputes the exact
+     * same values in reverse. That is what removes the flashing for good - the previous
+     * versions changed the layout in response to scrolling, and a layout change during a
+     * gesture is what produced both the oscillation and the "it just vanishes" jump.
+     */
+    private void applyShelfFade(int scrollY) {
+        if (shelfBlock == null) return;
+        if (shelfBlock.getVisibility() != View.VISIBLE) return;
+        if (shelfHeightPx <= 0) shelfHeightPx = shelfBlock.getHeight();
+        if (shelfHeightPx <= 0) return;
+
+        float travel = Math.max(1, Math.min(SHELF_FADE_PX, shelfHeightPx));
+        float t = Math.max(0f, Math.min(1f, scrollY / travel));
+        if (Math.abs(t - shelfFade) < 0.004f) return;   // nothing to redraw
+        shelfFade = t;
+
+        shelfBlock.setAlpha(1f - t);
+        shelfBlock.setTranslationY(-travelledHeight(t));
+        // The list padding is deliberately NOT touched here. Changing it while the list is
+        // scrolling fights the scroll: reducing top padding shifts the content back down by
+        // the same amount, so the rows appeared to move the wrong way (the first row went
+        // from y=1033 to y=1157 when scrolling down). The padding is set once in
+        // prepareShelfOverlay() and the shelf simply fades over it.
+    }
+
+    private float travelledHeight(float t) {
+        return shelfHeightPx * t;
+    }
+
+    /** Distance over which the shelf fades out. A short, deliberate travel: about one
+     *  shelf-height of scrolling, so it is gone by the time the second row reaches the top
+     *  rather than after a full screen of scrolling. */
+    private static final int SHELF_FADE_PX = 360;
+
+    /**
+     * Prepares the shelf after a new collection is shown.
+     *
+     * The list gets a top padding equal to the shelf so the first row starts below it; the
+     * shelf itself is positioned over that padding as an overlay. Layout is read after it
+     * has settled, which is why this is posted rather than run inline.
+     */
+    /**
+     * Fills the shelf with music that is genuinely different from the rows.
+     *
+     * The seed is the artist of the first result, because a search or a Spotify link is
+     * almost always about one artist. Every title already in the rows is excluded, so the
+     * shelf can never show a song the user is already looking at.
+     *
+     * The shelf is left hidden if nothing comes back. An empty rail would take the space
+     * without giving anything in return, which is the opposite of the point.
+     */
+    private void loadRelatedShelf(SpotifyCollection resolved) {
+        if (cardAdapter == null || resolved == null || resolved.tracks.isEmpty()) return;
+        final String seed = resolved.tracks.get(0).artist;
+        final java.util.Set<String> exclude = new java.util.HashSet<>();
+        for (Track t : resolved.tracks) {
+            exclude.add((t.title + "|" + (t.artist == null ? "" : t.artist)).toLowerCase(Locale.US));
+        }
+        MusicSearch.relatedTo(seed, exclude, new MusicSearch.Callback() {
+            @Override
+            public void onResults(List<Track> tracks) {
+                if (isFinishing() || cardAdapter == null) return;
+                // Playlists own the rail when they are present. This has to be the FIRST
+                // thing checked: submitting to the adapter first left recRail painting its
+                // cards underneath the playlists, which is what pushed the results off the
+                // screen even after the shelf itself stopped being shown.
+                boolean playlistsShowing = playlistRail != null
+                        && playlistRail.getVisibility() == View.VISIBLE;
+                if (playlistsShowing) {
+                    cardAdapter.submit(new ArrayList<>());
+                    if (recHeader != null) recHeader.setVisibility(View.GONE);
+                    return;
+                }
+                cardAdapter.submit(tracks);
+                if (recHeader != null) {
+                    recHeader.setText("More like " + (seed == null || seed.isEmpty() ? "this" : seed));
+                    recHeader.setVisibility(View.VISIBLE);
+                }
+                if (shelfBlock != null) {
+                    shelfBlock.setVisibility(View.VISIBLE);
+                    prepareShelfOverlay();
+                    shelfBlock.setAlpha(0f);
+                    shelfBlock.animate().alpha(1f).setDuration(220).start();
+                }
+            }
+
+            @Override
+            public void onFailed(String message) {
+                // No related music: leave the shelf out of the way rather than show a gap.
+                if (isFinishing()) return;
+                shelfAvailable = false;
+                if (cardAdapter != null) cardAdapter.submit(new ArrayList<>());
+                if (recHeader != null) recHeader.setVisibility(View.GONE);
+                hideShelfOverlay();
+            }
+        });
+    }
+
+    private void prepareShelfOverlay() {
+        if (shelfBlock == null || list == null) return;
+        shelfBlock.setVisibility(View.VISIBLE);
+        // Measure explicitly instead of waiting for a layout pass.
+        //
+        // Retrying post() eight times did not work: every post lands in the same message
+        // batch, so they all run before the next layout and each one still reads a height
+        // of 0. Measuring the block by hand with the list width gives a real number
+        // immediately, with no dependency on when the framework happens to lay out.
+        int w = list.getWidth();
+        if (w <= 0) w = getResources().getDisplayMetrics().widthPixels;
+        shelfBlock.measure(
+                android.view.View.MeasureSpec.makeMeasureSpec(w,
+                        android.view.View.MeasureSpec.EXACTLY),
+                android.view.View.MeasureSpec.makeMeasureSpec(0,
+                        android.view.View.MeasureSpec.UNSPECIFIED));
+        int h = shelfBlock.getMeasuredHeight();
+        if (h <= 0) return;
+        shelfHeightPx = h;
+        shelfFade = -1f;                     // force the next apply to run
+        shelfBlock.setAlpha(1f);
+        shelfBlock.setTranslationY(0f);
+        list.setPadding(list.getPaddingLeft(), shelfHeightPx,
+                list.getPaddingRight(), list.getPaddingBottom());
+        // A new collection must start at the TOP of the list. The results list is reused
+        // between searches, so it still carried the previous scroll offset - and the fade
+        // is a function of that offset, so the shelf was being born at alpha 0 and never
+        // seen. Resetting here also matches what a user expects from a fresh search.
+        list.scrollToPosition(0);
+        applyShelfFade(0);
+    }
+
+
+    /** Removes the shelf and its padding entirely, for a collection with nothing to show. */
+    private void hideShelfOverlay() {
+        if (shelfBlock == null) return;
+        shelfBlock.setVisibility(View.GONE);
+        shelfBlock.setAlpha(1f);
+        shelfBlock.setTranslationY(0f);
+        shelfHeightPx = 0;
+        shelfFade = 0f;
+        if (list != null) {
+            list.setPadding(list.getPaddingLeft(), 0, list.getPaddingRight(), list.getPaddingBottom());
+        }
+    }
+
     private void collapsePasteBlock() {
         View card = findViewById(R.id.pasteBlock);
         if (card == null) return;
@@ -1308,8 +1880,6 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         // Remembered before the request so a failed search is still one tap to retry.
         View pasteBlock = findViewById(R.id.pasteBlock);
         if (pasteBlock != null) pasteBlock.setVisibility(View.VISIBLE);
-        SearchHistory.remember(this, query);
-        renderRecentSearches();
         showGreeting();
         setBusy(true, "Searching for " + query + "...");
         MusicSearch.search(query, new MusicSearch.Callback() {
@@ -1331,6 +1901,177 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
                 setBusy(false, "Search failed: " + message);
             }
         });
+        // Playlists are a second, independent request. It is fired alongside the track
+        // search rather than after it so the two latencies overlap: a playlist endpoint
+        // that is slow must not delay the songs the user actually typed for.
+        searchPlaylists(query);
+    }
+
+    /**
+     * Fills the playlists rail under the results.
+     *
+     * Deliberately non-blocking and failure-tolerant: the track results are the primary
+     * answer to a search, and a playlist endpoint being down must not turn a successful
+     * search into an error. A failure simply leaves the rail hidden.
+     */
+    private void searchPlaylists(String query) {
+        MusicSearch.searchPlaylists(query, new MusicSearch.PlaylistCallback() {
+            @Override
+            public void onResults(java.util.List<PlaylistResult> playlists) {
+                playlistResults.clear();
+                playlistResults.addAll(playlists);
+                if (playlistRailAdapter != null) playlistRailAdapter.submit(playlists);
+                showPlaylistRail(!playlists.isEmpty());
+            }
+
+            @Override
+            public void onFailed(String message) {
+                playlistResults.clear();
+                if (playlistRailAdapter != null) {
+                    playlistRailAdapter.submit(new java.util.ArrayList<>());
+                }
+                showPlaylistRail(false);
+            }
+        });
+    }
+
+    /** Shows or hides the playlists rail and re-measures the shelf that contains it. */
+    private void showPlaylistRail(boolean visible) {
+        if (playlistHeader == null || playlistRail == null) return;
+        playlistHeader.setVisibility(visible ? View.VISIBLE : View.GONE);
+        playlistRail.setVisibility(visible ? View.VISIBLE : View.GONE);
+        // The related rail is hidden while playlists are up; bring it back when they go,
+        // or the next search would silently lose "More like this" for good.
+        if (!visible && recRail != null) recRail.setVisibility(View.VISIBLE);
+        // Only one rail is shown at a time. Two stacked rails measured 1187px of a 1600px
+        // pane, which left exactly two result rows visible above the fold - the search
+        // results, which are the point of the screen, were pushed off it. Playlists win
+        // because they are a specific answer to what was typed; "More like this" is a
+        // suggestion and is hidden while they are present.
+        if (shelfBlock == null) return;
+        if (visible) {
+            shelfAvailable = false;
+            if (cardAdapter != null) cardAdapter.submit(new ArrayList<>());
+            if (recHeader != null) recHeader.setVisibility(View.GONE);
+            // GONE, not just empty: an empty rail still reserves its margins.
+            if (recRail != null) recRail.setVisibility(View.GONE);
+            shelfBlock.setVisibility(View.VISIBLE);
+            shelfBlock.setAlpha(1f);
+        }
+        // The overlay's height drives the list padding, so any change is re-measured.
+        prepareShelfOverlay();
+    }
+
+    /**
+     * Opens a playlist: its tracks replace the current results.
+     *
+     * The playlist is NOT created locally here. Opening is a read; keeping a playlist is a
+     * deliberate act (its own button, or downloading it), which is the same distinction the
+     * app already makes for albums.
+     */
+    private void openPlaylist(PlaylistResult playlist) {
+        if (playlist == null) return;
+        setBusy(true, "Reading " + playlist.title + "...");
+        MusicSearch.loadPlaylistTracks(playlist, new MusicSearch.Callback() {
+            @Override
+            public void onResults(List<Track> tracks) {
+                SpotifyCollection found = new SpotifyCollection();
+                found.name = playlist.title;
+                found.type = "playlist";
+                found.owner = playlist.owner;
+                found.coverUrl = playlist.coverUrl;
+                found.tracks.addAll(tracks);
+                showCollection(found);
+                // Named after the playlist, not the search box: the rows now belong to the
+                // playlist, and a status line still showing the typed query would misdescribe
+                // what is on screen.
+                lastCollectionStatus = tracks.size() + " track" + (tracks.size() == 1 ? "" : "s")
+                        + " from " + playlist.title;
+                setBusy(false, lastCollectionStatus + " - tap Download");
+            }
+
+            @Override
+            public void onFailed(String message) {
+                setBusy(false, "Could not open that playlist: " + message);
+            }
+        });
+    }
+
+    /**
+     * Downloads a playlist AND keeps it as a local playlist.
+     *
+     * The two halves are deliberately separate concerns: the download queue already saves
+     * each track into Music/Cartify through MediaStore, and a Playlist is a list of those
+     * saved URIs. Creating the Playlist first, empty, and filling it as tracks finish means
+     * the user sees the playlist appear immediately and grow, instead of nothing happening
+     * until the whole queue drains.
+     *
+     * Tracks that were already in the library are added to the playlist straight away and
+     * are not re-downloaded - matching what the rows already show as "saved".
+     */
+    private void downloadPlaylist(PlaylistResult playlist) {
+        if (playlist == null) return;
+        if (queueRunning) {
+            toast("A download is still running. Wait for it to finish, or cancel it.");
+            return;
+        }
+        toast("Reading " + playlist.title + "...");
+        MusicSearch.loadPlaylistTracks(playlist, new MusicSearch.Callback() {
+            @Override
+            public void onResults(List<Track> tracks) {
+                if (tracks.isEmpty()) {
+                    toast("That playlist has no tracks");
+                    return;
+                }
+                // A fresh id each time: downloading the same playlist twice must produce a
+                // second playlist rather than silently overwrite the first one's contents.
+                Playlist local = new Playlist(playlist.title);
+                local.createdAt = System.currentTimeMillis();
+                pendingPlaylistId = local.id;
+                PlaylistStore.save(getApplicationContext(), local);
+
+                List<Track> toDownload = new ArrayList<>();
+                for (Track t : tracks) {
+                    // Already saved? Then only the playlist entry is missing.
+                    LibraryStore.Item existing = LibraryStore.findSaved(MainActivity.this,
+                            t.title, t.artist);
+                    if (existing != null && existing.uri != null && !existing.uri.isEmpty()) {
+                        t.localUri = existing.uri;
+                        t.status = Track.DONE;
+                        appendToPendingPlaylist(t);
+                    } else {
+                        toDownload.add(t);
+                    }
+                }
+                toast(local.songs.size() + " already saved, "
+                        + toDownload.size() + " to download");
+                if (toDownload.isEmpty()) {
+                    pendingPlaylistId = "";
+                    refreshPlaylists();
+                    toast("Playlist saved - nothing new to download");
+                    return;
+                }
+                startDownload(toDownload);
+            }
+
+            @Override
+            public void onFailed(String message) {
+                toast("Could not read that playlist: " + message);
+            }
+        });
+    }
+
+    /** Id of the playlist being filled by the running queue, or "" when none. */
+    private String pendingPlaylistId = "";
+
+    /** Adds one finished track to the playlist that this queue is building. */
+    private void appendToPendingPlaylist(Track t) {
+        if (pendingPlaylistId == null || pendingPlaylistId.isEmpty()) return;
+        if (t.localUri == null || t.localUri.isEmpty()) return;
+        Playlist p = PlaylistStore.byId(getApplicationContext(), pendingPlaylistId);
+        if (p == null) return;
+        p.add(t);
+        PlaylistStore.save(getApplicationContext(), p);
     }
 
     private void resolve() {
@@ -1369,13 +2110,23 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     private void showCollection(SpotifyCollection resolved) {
         collection = resolved;
         adapter.submit(resolved.tracks);
-        // The shelf mirrors the rows: same songs, shown as artwork first, which is how
-        // Spotify's home screen leads. Hidden when there is only one track, where a rail
-        // of one card adds nothing over the row.
-        if (cardAdapter != null && recRail != null) {
-            if (resolved.tracks.size() > 1) {
-                cardAdapter.submit(resolved.tracks);
-                recRail.setVisibility(View.VISIBLE);
+        // The shelf mirrors the rows: same songs, shown as artwork first. It opens fully
+        // visible at rest so the reader can see it exists; scrolling the results folds it
+        // away, which is what returns the full pane height to the rows.
+        boolean isPlaylist = "playlist".equals(resolved.type);
+        if (cardAdapter != null && shelfBlock != null) {
+            if (isPlaylist) {
+                // An opened playlist fills the pane. Its own tracks are what the user asked
+                // for; a recommendation rail above them pushed all but two rows off screen.
+                cardAdapter.submit(new ArrayList<>());
+                shelfAvailable = false;
+                if (recHeader != null) recHeader.setVisibility(View.GONE);
+                hideShelfOverlay();
+            } else if (resolved.tracks.size() > 1) {
+                // The shelf is filled ASYNCHRONOUSLY with genuinely different music (see
+                // loadRelatedShelf). Submitting resolved.tracks here was what made the
+                // shelf a duplicate of the rows above it.
+                shelfAvailable = true;
                 if (recHeader != null) {
                     // The collection bar directly above already names this list, so the
                     // shelf header only adds value when it says something different.
@@ -1383,10 +2134,15 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
                     recHeader.setText(shelfLabel);
                     recHeader.setVisibility(shelfLabel.isEmpty() ? View.GONE : View.VISIBLE);
                 }
+                shelfBlock.setVisibility(View.VISIBLE);
+                // Measured after layout so the list padding matches the real height.
+                prepareShelfOverlay();
+                loadRelatedShelf(resolved);
             } else {
                 cardAdapter.submit(new ArrayList<>());
-                recRail.setVisibility(View.GONE);
+                shelfAvailable = false;
                 if (recHeader != null) recHeader.setVisibility(View.GONE);
+                hideShelfOverlay();
             }
         }
         // Rows appear without a cascade animation. The old code set a layout animation
@@ -1395,34 +2151,72 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         // LayoutAnimationController.isDone() on a null reference. A cosmetic entrance is
         // not worth a crash on the most common action in the app.
         collapsePasteBlock();
-        collectionBar.setVisibility(View.VISIBLE);
         emptyState.setVisibility(View.GONE);
-        collectionName.setText(resolved.name);
-        String kind = resolved.isPlaylist()
-                ? ("Playlist \u00b7 " + resolved.tracks.size() + " tracks")
-                : "Single track";
-        collectionMeta.setText(kind + " \u00b7 saved as MP3");
-        // Keeping a resolved album or playlist was impossible before: the tracks were
-        // downloaded, but the grouping itself lived only on Spotify. One long-press
-        // turns the open collection into a local playlist.
-        collectionName.setOnLongClickListener(v -> {
-            showCollectionMenu();
-            return true;
-        });
-        collectionCover.setImageDrawable(null);
+        // The collection bar that used to sit here is gone: it cost a full row of height
+        // between the search box and the songs, and the count it carried is already in the
+        // status line above ("10 results for Coldplay"). Removing it gives both the result
+        // rows and the "More like this" shelf that height back.
+        //
+        // The long-press shortcut to the collection menu has to live somewhere, so it moves
+        // onto the status line: long-press that line to keep an album or playlist locally or
+        // to queue everything at once.
+        if (statusText != null) {
+            statusText.setOnLongClickListener(v -> {
+                showCollectionMenu();
+                return true;
+            });
+        }
         if (!resolved.coverUrl.isEmpty()) {
-            Track probe = new Track(resolved.name, "", resolved.coverUrl);
-            Art.load(this, probe, collectionCover);
+
         }
         lastCollectionStatus = resolved.tracks.size() + " track" + (resolved.tracks.size() == 1 ? "" : "s");
         setBusy(false, lastCollectionStatus + " ready - tap Download");
 
         markAlreadySaved(resolved.tracks);
-        // Per-track covers arrive in the background and repaint their row as they land;
-        // the list is usable immediately instead of waiting for every lookup.
-        SpotifyResolver.attachTrackArtwork(resolved, adapter::notifyDataSetChanged);
+        // Per-track covers arrive in the background, one every few hundred milliseconds.
+        // Passing notifyDataSetChanged directly here meant EVERY arriving cover rebound
+        // the whole list, and TrackAdapter blanks a row's cover when its URL changes — so
+        // a 25-track search flashed 25 times while the artwork trickled in. Coalescing the
+        // repaints into one at the end of the current frame turns that into a single quiet
+        // update, and the artwork still appears as it lands.
+        SpotifyResolver.attachTrackArtwork(resolved, this::repaintResultsSoon);
         // Resolve the first uploads now so tapping Download starts transferring at once.
         DownloadEngine.prewarm(getApplicationContext(), resolved.tracks);
+        // ...and the first rows' stream urls too, so the first play tap on a fresh list
+        // lands on a ready address instead of a 2-5 s resolution spinner. The first
+        // couple of rows are the likeliest first taps; the rest resolve on demand or
+        // are prefetched by the player once the queue exists.
+        // How many rows to warm depends on the link: on a fast connection the extra
+        // resolutions are nearly free and make the third and fourth tap instant too,
+        // while on a slow one they would compete with the song the user is already
+        // hearing, so only the very first row is worth spending bandwidth on.
+        // A new list makes the previous list's pre-warms worthless: drop them so their
+        // pool threads go to the rows the user is actually looking at now.
+        DownloadEngine.cancelPrewarms();
+        int streamPrewarm = Math.min(DownloadEngine.prewarmDepth(this), resolved.tracks.size());
+        for (int i = 0; i < streamPrewarm; i++) {
+            DownloadEngine.prewarmStream(getApplicationContext(), resolved.tracks.get(i));
+        }
+    }
+
+    /**
+     * One pending results repaint, at most one per frame.
+     *
+     * Background work (arriving artwork, the already-saved scan) wants to refresh the list
+     * whenever it makes progress. Calling notifyDataSetChanged for each of those events
+     * rebinds every visible row, and because a row blanks its cover when the artwork URL
+     * changes, a burst of callbacks reads on screen as a flicker. Posting one repaint and
+     * dropping the rest until it runs keeps the list calm without delaying the data.
+     */
+    private final Runnable repaintResults = () -> {
+        if (adapter != null) adapter.notifyDataSetChanged();
+    };
+
+    /** Schedules a results repaint, coalescing any that are already queued. */
+    private void repaintResultsSoon() {
+        if (list == null) return;
+        list.removeCallbacks(repaintResults);
+        list.post(repaintResults);
     }
 
     /** Actions for the open collection: keep it, or download what is missing. */
@@ -1431,11 +2225,61 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         List<MenuSheet.Item> items = new ArrayList<>();
         items.add(new MenuSheet.Item(R.drawable.ic_queue, "Save as playlist",
                 this::saveCollectionAsPlaylist));
-        items.add(new MenuSheet.Item(R.drawable.ic_download, "Download all",
-                () -> startDownload(collection.tracks)));
+        final boolean playlist = "playlist".equals(collection.type);
+        items.add(new MenuSheet.Item(R.drawable.ic_download,
+                playlist ? "Download all & keep playlist" : "Download all",
+                () -> {
+                    // Downloading a playlist must leave a playlist behind, not just files:
+                    // that is the difference between "I downloaded 30 songs" and "I have
+                    // this playlist offline". Albums and searches keep plain behaviour.
+                    if (playlist) downloadCollectionAsPlaylist();
+                    else startDownload(collection.tracks);
+                }));
         MenuSheet.show(this, collection.name, collection.tracks.size()
                 + (collection.tracks.size() == 1 ? " track" : " tracks"),
                 items.toArray(new MenuSheet.Item[0]));
+    }
+
+    /**
+     * Downloads an already-open playlist and keeps it locally.
+     *
+     * The search rail path ({@link #downloadPlaylist}) re-fetches the tracks; this one
+     * already has them on screen, so it only does the queueing half. Splitting it this way
+     * avoids a second network round trip for something the user is looking at.
+     */
+    private void downloadCollectionAsPlaylist() {
+        if (collection == null || collection.tracks.isEmpty()) return;
+        if (queueRunning) {
+            toast("A download is still running. Wait for it to finish, or cancel it.");
+            return;
+        }
+        Playlist local = new Playlist(collection.name);
+        local.createdAt = System.currentTimeMillis();
+        pendingPlaylistId = local.id;
+
+        List<Track> toDownload = new ArrayList<>();
+        for (Track t : new ArrayList<>(collection.tracks)) {
+            LibraryStore.Item hit = LibraryStore.findSaved(this, t.title, t.artist);
+            if (hit != null && hit.uri != null && !hit.uri.isEmpty()) {
+                t.localUri = hit.uri;
+                t.status = Track.DONE;
+                local.add(t);
+            } else {
+                toDownload.add(t);
+            }
+        }
+        // Saved once, with everything already on disk included: the playlist appears in the
+        // Playlists tab immediately and grows as the queue finishes the rest.
+        PlaylistStore.save(getApplicationContext(), local);
+        pendingPlaylistId = local.id;
+        refreshPlaylists();
+        if (toDownload.isEmpty()) {
+            pendingPlaylistId = "";
+            toast("Playlist saved - everything was already downloaded");
+            return;
+        }
+        toast("Playlist saved - downloading " + toDownload.size());
+        startDownload(toDownload);
     }
 
     /**
@@ -1558,7 +2402,15 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
             toast("Nothing to download");
             return;
         }
+        // A queue started from the player (or one that is still running) owns the
+        // service's single queue. Starting a second one here would overwrite its
+        // positions and paint progress onto the wrong rows.
+        if (DownloadState.running && !queueRunning) {
+            toast("A download is already running");
+            return;
+        }
         queueRunning = true;
+        DownloadState.running = true;
         for (Track t : tracks) {
             t.status = Track.QUEUED;
             t.progress = 0;
@@ -1570,7 +2422,6 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         submitted.addAll(tracks);
         refreshDownloads();
         adapter.notifyDataSetChanged();
-        collectionBar.setVisibility(View.VISIBLE);
         emptyState.setVisibility(View.GONE);
         statusText.setText("Starting downloader\u2026");
         // The button doubles as "Cancel all" and "Retry failed". A fresh queue must get
@@ -1620,6 +2471,7 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
 
     private void cancelAllDownloads() {
         queueRunning = false;
+        DownloadState.running = false;
         startService(new Intent(this, DownloadService.class).setAction(DownloadService.ACTION_CANCEL));
         for (int i = 0; i < adapter.getItemCount(); i++) {
             Track t = adapter.items().get(i);
@@ -1663,7 +2515,20 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         if (error != null) t.error = error;
         int pos = adapter.items().indexOf(t);
         if (pos >= 0) adapter.update(pos, status, percent, detail, uri, error);
-        if (downloadsAdapter != null) refreshDownloads();
+        // Only rebuild the Downloads list when its MEMBERSHIP changes. A progress tick
+        // used to submit() the whole adapter, rebinding every visible row several times a
+        // second for no reason; a row already on the page only needs its own progress
+        // payload repainted.
+        if (downloadsAdapter != null) {
+            int dpos = downloadsAdapter.items().indexOf(t);
+            boolean leaves = (status == Track.DONE || status == Track.IDLE);
+            boolean enters = (status == Track.ERROR);
+            if (dpos < 0 || leaves || enters) {
+                refreshDownloads();
+            } else {
+                downloadsAdapter.update(dpos, status, percent, detail, uri, error);
+            }
+        }
     }
 
     @Override
@@ -1680,8 +2545,15 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     public void onTrackFinished(int index, String uri, String error) {
         Track t = trackForQueueIndex(index);
         if (t == null) return;
-        if (error == null) applyQueueState(t, Track.DONE, 100, "saved", uri, null);
-        else applyQueueState(t, Track.ERROR, 0, error, null, error);
+        if (error == null) {
+            applyQueueState(t, Track.DONE, 100, "saved", uri, null);
+            // A queue started by downloading a playlist fills that playlist as it goes,
+            // so the user watches it grow instead of waiting for the whole queue to drain.
+            t.localUri = uri;
+            appendToPendingPlaylist(t);
+        } else {
+            applyQueueState(t, Track.ERROR, 0, error, null, error);
+        }
     }
 
     @Override
@@ -1705,6 +2577,14 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         }
         statusText.setText(summary);
         queueRunning = false;
+        DownloadState.running = false;
+        // The queue that was building a playlist has drained: refresh the Playlists tab so
+        // it shows the new list, and clear the id so a later single-track download does not
+        // keep appending to it.
+        if (pendingPlaylistId != null && !pendingPlaylistId.isEmpty()) {
+            pendingPlaylistId = "";
+            refreshPlaylists();
+        }
         for (Track t : new ArrayList<>(submitted)) {
             if (t.status == Track.QUEUED || t.status == Track.ACTIVE) {
                 applyQueueState(t, Track.IDLE, 0, "", null, "");
@@ -1757,7 +2637,7 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         }
         sortLibrary(shown);
         songAdapter.setGrouped(libraryGrouped, shown);
-        String suffix = libraryQuery.isEmpty() ? "" : " Â· filtered";
+        String suffix = libraryQuery.isEmpty() ? "" : " \u00b7 filtered";
         libraryStatus.setText(libraryAll.size() + " song" + (libraryAll.size() == 1 ? "" : "s") + suffix);
         updateLibraryEmpty();
     }
@@ -2291,6 +3171,33 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         openPlayer();
     }
 
+    /**
+     * Plays a search result immediately, streaming it from the network.
+     *
+     * The row list is the queue, so a song plays and the next one follows without the
+     * user having to save anything. Rows that are already saved keep playing from disk:
+     * the queue is built from {@link Track#playbackUri()}, which prefers the local file,
+     * so a mixed list of saved and unsaved songs works in one press.
+     */
+    private void streamFromList(int index) {
+        List<Track> items = adapter.items();
+        if (index < 0 || index >= items.size()) return;
+        List<Track> queue = new ArrayList<>();
+        int start = -1;
+        for (Track t : items) {
+            // Every row is playable here: a saved one from disk, an unsaved one by
+            // resolving its stream when it becomes current. Filtering on playbackUri()
+            // skipped exactly the unsaved rows this method exists for, so nothing was
+            // ever queued and the tap looked dead.
+            if (t.title == null || t.title.trim().isEmpty()) continue;
+            if (t == items.get(index)) start = queue.size();
+            queue.add(t);
+        }
+        if (start < 0) return;
+        playback.playQueue(queue, start, collection == null ? "Cartify" : collection.name);
+        openPlayer();
+    }
+
     private void playLibraryFrom(int index) {
         List<Track> songs = songAdapter.items();
         if (index < 0 || index >= songs.size()) return;
@@ -2319,16 +3226,53 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     private void renderMini() {
         Track t = playback.current();
         if (t == null) {
-            miniPlayer.setVisibility(View.GONE);
+            // Slide it away rather than removing it in one frame, so the list underneath
+            // does not jump by the bar's height the instant a queue empties.
+            if (miniPlayer.getVisibility() == View.VISIBLE) {
+                miniPlayer.animate().cancel();
+                miniPlayer.animate().alpha(0f).translationY(18f * getResources().getDisplayMetrics().density)
+                        .setDuration(180)
+                        .withEndAction(() -> {
+                            miniPlayer.setVisibility(View.GONE);
+                            miniPlayer.setAlpha(1f);
+                            miniPlayer.setTranslationY(0f);
+                        }).start();
+            }
             return;
         }
-        miniPlayer.setVisibility(View.VISIBLE);
+        if (miniPlayer.getVisibility() != View.VISIBLE) {
+            // First track of a session: rise into place instead of appearing.
+            miniPlayer.animate().cancel();
+            miniPlayer.setVisibility(View.VISIBLE);
+            miniPlayer.setAlpha(0f);
+            miniPlayer.setTranslationY(24f * getResources().getDisplayMetrics().density);
+            miniPlayer.animate().alpha(1f).translationY(0f)
+                    .setDuration(260)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                    .start();
+        }
         miniTitle.setText(t.title);
-        miniArtist.setText(t.artist.isEmpty() ? "Unknown artist" : t.artist);
+        String who = t.artist.isEmpty() ? "Unknown artist" : t.artist;
+        // A stream takes a second or two to resolve, and a bar that shows only the artist
+        // during that time looks stuck. Saying what it is waiting for is the difference
+        // between "connecting" and "broken".
+        if (playback.isResolvingStream()) who = who + "  \u00b7  connecting\u2026";
+        else if (playback.isStream()) who = who + "  \u00b7  streaming";
+        miniArtist.setText(who);
         // While a file is still preparing the player reports "not playing"; the icon
         // follows the user's intent instead so it never flips back under the finger.
         boolean showPause = playback.isPlaying() || (playback.isLoading() && playback.wantsPlay());
         miniPlayPause.setImageResource(showPause ? R.drawable.ic_pause : R.drawable.ic_play);
+        // The save button states what it can do: a song already on the device gets a
+        // check instead of a download arrow, so the bar never offers a no-op.
+        View miniDownload = findViewById(R.id.miniDownload);
+        if (miniDownload != null) {
+            boolean saved = t.localUri != null && !t.localUri.isEmpty();
+            ((ImageView) miniDownload).setImageResource(
+                    saved ? R.drawable.ic_check : R.drawable.ic_download);
+            miniDownload.setAlpha(saved ? 0.55f : 1f);
+            miniDownload.setContentDescription(saved ? "Saved to device" : "Download this song");
+        }
         Art.load(this, t, miniArt);
         updateMiniProgress();
     }
@@ -2389,6 +3333,12 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
                 () -> addToPlaylist(t)));
         items.add(new MenuSheet.Item(R.drawable.ic_info, "Open full player",
                 () -> openPlayer()));
+        // Offered here as well as on the bar's own button, because the menu is what the
+        // user opens when looking for "what else can I do with this song".
+        if (t.localUri == null || t.localUri.isEmpty()) {
+            items.add(new MenuSheet.Item(R.drawable.ic_download, "Download this song",
+                    this::downloadCurrentTrack));
+        }
         items.add(new MenuSheet.Item(R.drawable.ic_download, "Check for updates",
                 this::checkForUpdatesManually));
         MenuSheet.show(this, t.title, subtitle, items.toArray(new MenuSheet.Item[0]));
@@ -2533,8 +3483,41 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        // Fires only on the transition from "nothing started" to "something started", so an
+        // in-app jump to the player and back does not replay the intro, while returning from
+        // the launcher or Recents does.
+        if (AppLifecycle.onActivityStarted()) {
+            splashShown = false;
+            playIntro();
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        AppLifecycle.onActivityStopped();
+        super.onStop();
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
+        // Coming back from the "install unknown apps" page: if the user allowed it, the
+        // update they already consented to starts without asking again.
+        if (awaitingInstallPermission && !updateDownloading
+                && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                || getPackageManager().canRequestPackageInstalls())) {
+            awaitingInstallPermission = false;
+            // If the APK already landed, install it. Re-downloading a file that is
+            // sitting in the cache was pure waste, and on a slow link it looked like
+            // the permission grant had done nothing.
+            if (downloadedUpdate != null && downloadedUpdate.exists()) {
+                Updater.install(this, downloadedUpdate);
+            } else if (pendingUpdate != null) {
+                downloadUpdate(pendingUpdate);
+            }
+        }
         renderMini();
         syncNowPlayingHighlight();
         if (playlistAdapter != null) refreshPlaylists();
@@ -2548,6 +3531,7 @@ public class MainActivity extends AppCompatActivity implements ProgressBus.Liste
         ProgressBus.unregister(this);
         playback.removeListener(this);
         main.removeCallbacks(miniTicker);
+        stopUpdatePulse();
         if (splash != null) splash.stop();
         super.onDestroy();
     }

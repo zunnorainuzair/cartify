@@ -33,6 +33,15 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
         void onCancelClicked(Track track, int index);
 
         void onPlayClicked(Track track, int index);
+
+        /**
+         * Stream a row that has never been saved.
+         *
+         * Defaulted so the downloads list, which only ever holds saved or in-progress
+         * rows, does not have to implement a stream path it cannot reach.
+         */
+        default void onStreamClicked(Track track, int index) {
+        }
     }
 
     private static final ExecutorService IMAGES = Executors.newFixedThreadPool(3);
@@ -102,7 +111,12 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
     /** Repaints only the progress widgets, leaving artwork and text untouched. */
     private void bindProgress(VH h, Track t) {
         boolean busy = t.status == Track.QUEUED || t.status == Track.ACTIVE;
-        h.progress.setVisibility(busy || t.status == Track.DONE ? View.VISIBLE : View.INVISIBLE);
+        // Saved rows show no bar. A track already on the device has no progress to
+        // report, and drawing one at 100% put a full-width neon strip on every
+        // already-downloaded row - the brightest thing in the list, saying nothing.
+        // GONE, not INVISIBLE: the wave is weighted, so an invisible one still
+        // claimed the row and pushed "saved" out to the right edge.
+        h.progress.setVisibility(busy ? View.VISIBLE : View.GONE);
         h.ring.setVisibility(busy ? View.VISIBLE : View.GONE);
         h.progress.setProgress(t.progress);
         if (busy) h.progress.start(); else h.progress.stop();
@@ -123,22 +137,42 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
         String sub = t.artist;
         if (t.durationText().length() > 0) sub = sub + "  ·  " + t.durationText();
         h.subtitle.setText(sub);
-        // Clear the artwork only when the URL really changed. Blanking it on every
-        // rebind made an already-visible cover blink back in.
-        String wantedCover = t.coverUrl == null ? "" : t.coverUrl;
-        if (!wantedCover.equals(h.cover.getTag(R.id.cover))) {
-            h.cover.setTag(R.id.cover, wantedCover);
-            h.cover.setImageDrawable(null);
-            h.cover.setAlpha(0f);
-            loadCover(h.cover, wantedCover);
-        }
+        // Only clear the artwork when the URL really changed, and only blank it when the
+        // replacement is not already in memory. The old order — blank first, then load —
+        // produced a guaranteed blink on every rebind even when Net.bitmap answered from
+        // its cache in the same frame: the cover was set to null and alpha 0, and the
+        // bitmap was only put back a moment later. On a list that rebinds often (progress
+        // ticks, artwork arriving, the already-saved scan) that is what reads as flashing.
+        // Art.load, like every other adapter in the app, instead of a private copy of the
+        // loader. This row used Net.bitmap directly, which is network-only: no disk cache,
+        // no embedded-artwork fallback, no retry. A cover that failed to arrive left the
+        // row blank forever, while the shelf above - which uses Art.load - showed the same
+        // artwork perfectly. That divergence is what the empty squares in the rows were.
+        h.cover.setAlpha(1f);
+        Art.load(h.itemView.getContext(), t, h.cover, null,
+                coverTargetPx(h.itemView.getContext()));
 
         boolean busy = t.status == Track.QUEUED || t.status == Track.ACTIVE;
-        h.progress.setVisibility(busy || t.status == Track.DONE ? View.VISIBLE : View.INVISIBLE);
+        // Saved rows show no bar. A track already on the device has no progress to
+        // report, and drawing one at 100% put a full-width neon strip on every
+        // already-downloaded row - the brightest thing in the list, saying nothing.
+        // GONE, not INVISIBLE: the wave is weighted, so an invisible one still
+        // claimed the row and pushed "saved" out to the right edge.
+        h.progress.setVisibility(busy ? View.VISIBLE : View.GONE);
         h.ring.setVisibility(busy ? View.VISIBLE : View.GONE);
         h.progress.setProgress(t.progress);
         if (t.status == Track.ACTIVE) h.progress.start(); else h.progress.stop();
         animate(h.ring, t.progress);
+
+        // The play button is always about hearing the song, in every state; the action
+        // button is always about keeping it. They used to be one button, so a row could
+        // only be heard by downloading it first - and once saved, the download button
+        // turned into a play button, which is why "save this while it plays" had nowhere
+        // to live.
+        h.play.setVisibility(View.VISIBLE);
+        h.play.setContentDescription(t.localUri.isEmpty() ? "Stream" : "Play");
+        h.play.setAlpha(busy ? 0.4f : 1f);
+        h.play.setEnabled(!busy);
 
         switch (t.status) {
             case Track.QUEUED:
@@ -155,9 +189,13 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
                 break;
             case Track.DONE:
                 h.percent.setText("saved");
-                h.action.setImageResource(R.drawable.ic_play);
-                h.action.setContentDescription("Play");
-                h.action.setEnabled(true);
+                // Saved: the action becomes a state, not an action. Leaving a play icon
+                // here made the row offer two identical ways to start the song, while
+                // the actual "save while playing" case had no button at all.
+                h.action.setImageResource(R.drawable.ic_download);
+                h.action.setContentDescription("Saved");
+                h.action.setEnabled(false);
+                h.action.setAlpha(0.45f);
                 break;
             case Track.ERROR:
                 h.percent.setText("failed");
@@ -175,14 +213,68 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
                 h.action.setEnabled(true);
                 break;
         }
+        // Only the saved state dims the button; every other state must look tappable
+        // after a row is recycled from a saved one.
+        if (t.status != Track.DONE) h.action.setAlpha(1f);
+
+        // A saved row that is currently being heard from the network says so: the same
+        // title otherwise appears once as "saved" while the mini player streams it, which
+        // reads as the app ignoring the tap.
+        if (t.status == Track.IDLE && t.isStreaming()) {
+            h.percent.setText("streaming");
+        }
 
         h.action.setOnClickListener(v -> {
             int pos = h.getBindingAdapterPosition();
             if (pos == RecyclerView.NO_POSITION) return;
+            press(h.action);
+            if (t.status == Track.QUEUED || t.status == Track.ACTIVE) actions.onCancelClicked(t, pos);
+            else if (t.status == Track.DONE) {
+                // Already saved: nothing to fetch. Deletion lives in the row menu.
+            } else actions.onDownloadClicked(t, pos);
+        });
+
+        h.play.setOnClickListener(v -> {
+            int pos = h.getBindingAdapterPosition();
+            if (pos == RecyclerView.NO_POSITION) return;
+            press(h.play);
+            // A saved row plays its file; anything else streams. Both land in the same
+            // queue, so the next row follows on its own - and the song can be saved
+            // from the player while it is still playing.
+            if (t.status == Track.DONE) actions.onPlayClicked(t, pos);
+            else actions.onStreamClicked(t, pos);
+        });
+        // Tapping the row plays it right away - a saved file from the library, a stream
+        // from the network - so hearing a search result no longer costs a download.
+        // The button keeps doing exactly what it did: save the song, or cancel a save.
+        h.itemView.setOnClickListener(v -> {
+            int pos = h.getBindingAdapterPosition();
+            if (pos == RecyclerView.NO_POSITION) return;
             if (t.status == Track.DONE) actions.onPlayClicked(t, pos);
             else if (t.status == Track.QUEUED || t.status == Track.ACTIVE) actions.onCancelClicked(t, pos);
-            else actions.onDownloadClicked(t, pos);
+            else actions.onStreamClicked(t, pos);
         });
+        h.itemView.setContentDescription(t.status == Track.DONE
+                ? t.title + ", saved. Tap to play."
+                : t.title + ". Tap to stream, or use the button to save.");
+    }
+
+    /**
+     * A short dip on a row's action button.
+     *
+     * The row can sit in four different states and the icon changes with them, so without
+     * a physical acknowledgement a tap can look as if nothing happened until the download
+     * bar finally moves. A 0.9 scale for 200 ms is enough to confirm the tap.
+     */
+    private static void press(View view) {
+        if (view == null) return;
+        view.animate().cancel();
+        view.setScaleX(0.86f);
+        view.setScaleY(0.86f);
+        view.animate().scaleX(1f).scaleY(1f)
+                .setDuration(200)
+                .setInterpolator(new android.view.animation.OvershootInterpolator(2f))
+                .start();
     }
 
     /**
@@ -231,10 +323,18 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
         anim.start();
     }
 
+    /** Width a list row's cover is actually drawn at, in pixels. */
+    private static int coverTargetPx(android.content.Context context) {
+        // The row cover is 54dp; 2x covers high-density screens without wasting memory.
+        float d = context.getResources().getDisplayMetrics().density;
+        return Math.max(64, Math.round(54 * d * 2f));
+    }
+
     private void loadCover(ImageView view, String url) {
         view.setTag(url);
         if (url == null || url.isEmpty()) return;
-        Bitmap cached = Net.bitmap(url);
+        final int targetPx = coverTargetPx(view.getContext());
+        Bitmap cached = Net.bitmap(url, targetPx);
         if (cached != null) {
             reveal(view, cached);
             return;
@@ -251,7 +351,7 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
             if (!IN_FLIGHT.add(url)) return;   // already fetching this artwork
         }
         IMAGES.execute(() -> {
-            final Bitmap b = Net.bitmap(url);
+            final Bitmap b = Net.bitmap(url, targetPx);
             List<ImageView> targets;
             synchronized (WAITING) {
                 targets = WAITING.remove(url);
@@ -286,6 +386,8 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
         final WaveProgressView progress;
         final ProgressBar ring;
         final ImageButton action;
+        /** Plays the row immediately; the action button saves or cancels a save. */
+        final ImageButton play;
 
         VH(@NonNull View v) {
             super(v);
@@ -296,6 +398,7 @@ public class TrackAdapter extends RecyclerView.Adapter<TrackAdapter.VH> {
             progress = v.findViewById(R.id.progress);
             ring = v.findViewById(R.id.ring);
             action = v.findViewById(R.id.action);
+            play = v.findViewById(R.id.playButton);
         }
     }
 }

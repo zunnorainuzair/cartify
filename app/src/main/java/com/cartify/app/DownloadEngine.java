@@ -188,6 +188,108 @@ public final class DownloadEngine {
         }, "cartify-prewarm").start();
     }
 
+    /**
+     * Bounded pool for background stream pre-warms.
+     *
+     * Four, not two: a resolution costs 15-30 s on a slow link, and with only two
+     * threads the previous screen's pre-warms held both of them, so a fresh search
+     * sat in the queue and the first tap still paid the full price. Four lets a new
+     * list start warming while the old one is still finishing.
+     */
+    private static final java.util.concurrent.ExecutorService STREAM_POOL =
+            java.util.concurrent.Executors.newFixedThreadPool(4, r -> {
+                Thread t = new Thread(r, "cartify-prewarm-stream");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
+     * Bumped whenever a new collection is shown.
+     *
+     * A pre-warm that belongs to a list the user has already left is pure waste: it
+     * holds a pool thread for half a minute and delays the rows that are actually on
+     * screen. Tasks compare their generation against this and give up early.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger PREWARM_GEN =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /** Abandons every in-flight pre-warm; the next collection starts a new generation. */
+    public static void cancelPrewarms() {
+        PREWARM_GEN.incrementAndGet();
+    }
+
+    /**
+     * Resolves a row's stream URL before the user taps play, so the tap lands on a
+     * ready address instead of a 2-5 s spinner.
+     *
+     * The result is written back onto the Track ({@link Track#streamUrl}), so a later
+     * {@code playQueue()} of the same objects opens it immediately. Fails silently: an
+     * unresolvable track simply resolves again, visibly, when play is actually pressed.
+     */
+    public static void prewarmStream(final Context context, final Track track) {
+        if (track == null) return;
+        // Plays from disk, or is already resolved, or a resolution is already running.
+        if (track.localUri != null && !track.localUri.isEmpty()) return;
+        if (track.streamUrl != null && !track.streamUrl.isEmpty()) return;
+        if (track.prefetching) return;
+        track.prefetching = true;
+        final int gen = PREWARM_GEN.get();
+        STREAM_POOL.execute(() -> {
+            try {
+                // The list this row belonged to is gone; do not spend a thread on it.
+                if (gen != PREWARM_GEN.get()) return;
+                String url = resolveStream(context.getApplicationContext(), track, null);
+                if (url != null && !url.isEmpty() && track.streamUrl.isEmpty()) {
+                    track.streamUrl = url;
+                    // Resolving only produces an address; the first byte still costs a
+                    // DNS lookup, a TLS handshake and a TCP ramp-up. Doing that here,
+                    // while the user is still reading the list, is what turns the tap
+                    // into a near-instant start on a slow mobile link.
+                    warmConnection(url);
+                }
+            } catch (Throwable ignored) {
+                // On-demand resolution will try again, visibly, when play is pressed.
+            } finally {
+                track.prefetching = false;
+            }
+        });
+    }
+
+    /**
+     * Primes DNS, TLS and the TCP window for a resolved stream url by asking for the
+     * first few kilobytes and throwing them away.
+     *
+     * MediaPlayer opens its own connection, so this cannot be shared with it; what it
+     * buys is a warm resolver cache and an established route, which is most of the
+     * delay on a high-latency mobile network. Best effort: any failure is ignored and
+     * the real playback request simply pays the cost it would have paid anyway.
+     */
+    private static void warmConnection(String url) {
+        java.net.HttpURLConnection c = null;
+        try {
+            c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            c.setConnectTimeout(6000);
+            c.setReadTimeout(6000);
+            c.setRequestProperty("Range", "bytes=0-16383");
+            c.setRequestProperty("User-Agent", "com.cartify.app");
+            c.setUseCaches(false);
+            c.getResponseCode();
+            java.io.InputStream in = c.getInputStream();
+            byte[] buf = new byte[8192];
+            int total = 0;
+            while (total < 16384) {
+                int n = in.read(buf);
+                if (n < 0) break;
+                total += n;
+            }
+            in.close();
+        } catch (Throwable ignored) {
+            // A cold connection is not an error; playback will just open it itself.
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
     public static String download(Context context, Track track, Listener listener, int slot) throws Exception {
         return download(context, track, listener, slot, new Task());
     }
@@ -214,8 +316,209 @@ public final class DownloadEngine {
         }
     }
 
+    // ------------------------------------------------------------------ streaming
+
+    /**
+     * Resolves a direct audio URL for real-time playback, without downloading.
+     *
+     * The download path exists to produce an MP3 that outlives the app; this one exists so a
+     * search result can be heard seconds after the tap. Both go through the same candidate
+     * picker, so a stream and a later download of the same row are the same upload.
+     *
+     * Runs on a worker thread and returns the media URL yt-dlp prints with -g. MediaPlayer
+     * plays that URL directly, which is why nothing is written to disk here.
+     */
+    public static String resolveStream(Context context, Track track, Task task) throws Exception {
+        final Task job = task == null ? new Task() : task;
+        ensureInitialised(context);
+        job.check();
+        String query = track.searchQuery();
+        if (query.trim().isEmpty()) throw new Failure("search", "Track has no title");
+        final long tResolveStart = android.os.SystemClock.elapsedRealtime();
+
+        String picked = PICKED.get(query);
+        if (picked == null) {
+            picked = pickCandidate(query, track, job);
+            PICKED.put(query, picked);
+        }
+        job.check();
+        final long pickMs = android.os.SystemClock.elapsedRealtime() - tResolveStart;
+
+        // A resolved CDN url is valid for hours, so re-playing a song, skipping back or
+        // letting a queued track come round again must not run a second extraction. The
+        // tap then goes straight to MediaPlayer instead of waiting 3-10 s on yt-dlp.
+        String cached = streamCacheGet(picked);
+        if (cached != null) {
+            Log.i(TAG, "stream cache hit for \"" + track.title + "\" (pick=" + pickMs + "ms)");
+            return cached;
+        }
+
+        Failure last = null;
+        for (int attempt = 0; attempt < STREAM_CHAINS.length; attempt++) {
+            String chain = STREAM_CHAINS[attempt];
+            YoutubeDLRequest request = new YoutubeDLRequest(picked);
+            // m4a first: it is the one container every MediaPlayer handles. A webm/opus
+            // stream resolves just as well but is silent on older devices, which reads as
+            // "streaming is broken" rather than "this device has no Opus decoder".
+            request.addOption("-f", "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best");
+            request.addOption("-S", "abr,ext:m4a");
+            request.addOption("--no-playlist");
+            // The watch page is a large HTML document that yt-dlp parses only to find
+            // the player config; the innertube clients used here get that from the API
+            // directly, so on the first attempt the page is skipped. That removes two
+            // round trips and a JS parse from the critical path. It is attempt 0 only:
+            // if a client does need the page, the next chain runs without the skip and
+            // still resolves, so the saving can never turn into a failure.
+            String extractorArgs = "youtube:player_client=" + chain
+                    + (attempt == 0 ? ";player_skip=webpage" : "");
+            request.addOption("--extractor-args", extractorArgs);
+            request.addOption("--no-warnings");
+            // -g prints the media URL and stops; no transfer happens.
+            request.addOption("-g");
+            // Streaming is a speed game: the chain loop below is the real retry (it
+            // switches client rather than repeating the same one), so an in-chain retry
+            // only adds wall time. One is kept for a truly transient socket drop.
+            request.addOption("--retries", "1");
+            request.addOption("--socket-timeout", String.valueOf(streamSocketTimeout(context)));
+
+            String id = "cartify-stream-" + System.nanoTime() + "-" + attempt;
+            job.bind(id);
+            YoutubeDLResponse response;
+            try {
+                response = YoutubeDL.getInstance().execute(request, id, null);
+            } catch (Throwable e) {
+                job.check();
+                last = new Failure("stream", describe(e));
+                continue;
+            }
+            job.bind("");
+            job.check();
+            String url = firstHttpUrl(response == null ? null : response.getOut());
+            if (url != null) {
+                streamCachePut(picked, url);
+                long totalMs = android.os.SystemClock.elapsedRealtime() - tResolveStart;
+                lastResolveMs = totalMs;
+                Log.i(TAG, "stream resolved \"" + track.title + "\" in " + totalMs
+                        + " ms (pick=" + pickMs + "ms attempt=" + attempt
+                        + " chain=" + chain + ")");
+                return url;
+            }
+            String err = response == null ? "" : errorLine(response.getErr());
+            last = new Failure("stream", err.isEmpty() ? "No stream URL" : err);
+        }
+        throw last == null ? new Failure("stream", "Could not resolve a stream") : last;
+    }
+
+    /** Resolved CDN urls, keyed by the picked upload. */
+    private static final long STREAM_TTL_MS = 45L * 60L * 1000L;
+    private static final Map<String, String[]> STREAMS =
+            java.util.Collections.synchronizedMap(
+                    new java.util.LinkedHashMap<String, String[]>(32, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(Map.Entry<String, String[]> e) {
+                            return size() > 24;
+                        }
+                    });
+
+    /**
+     * A previously resolved media url for this upload, or null.
+     *
+     * A YouTube media url stays valid for hours, so re-playing a song, skipping back or
+     * letting a queued track come round again must not run a second extraction. The TTL
+     * is well inside the real lifetime: an address that does expire is handled by the
+     * player's existing one-shot re-resolve, so guessing long risks one retry while
+     * guessing short throws the speed-up away.
+     */
+    private static String streamCacheGet(String picked) {
+        String[] hit = STREAMS.get(picked);
+        if (hit == null) return null;
+        long age = System.currentTimeMillis() - Long.parseLong(hit[1]);
+        if (age < 0 || age > STREAM_TTL_MS) {
+            STREAMS.remove(picked);
+            return null;
+        }
+        return hit[0];
+    }
+
+    private static void streamCachePut(String picked, String url) {
+        if (picked == null || url == null || url.isEmpty()) return;
+        STREAMS.put(picked, new String[]{url, String.valueOf(System.currentTimeMillis())});
+    }
+
+    /** The first http(s) line of yt-dlp's output; -g prints one URL per line. */
+    private static String firstHttpUrl(String out) {
+        if (out == null) return null;
+        for (String line : out.split("\r?\n")) {
+            String s = line.trim();
+            if (s.startsWith("http://") || s.startsWith("https://")) return s;
+        }
+        return null;
+    }
+
+    /**
+     * How long one client-chain resolution may wait before it is abandoned.
+     *
+     * Resolution latency is dominated by YouTube's answer, not the link, but the link
+     * decides how long a stalled answer is worth waiting for: on a fast connection a
+     * hung chain should be dropped quickly so the next client can be tried, while on a
+     * slow one the same silence may just be the pipe crawling and deserves more time.
+     */
+    private static int streamSocketTimeout(Context context) {
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return 20;
+            android.net.Network net = cm.getActiveNetwork();
+            if (net == null) return 25;
+            android.net.NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+            if (caps == null) return 25;
+            int kbps = caps.getLinkDownstreamBandwidthKbps();
+            if (kbps <= 0) return 20;
+            if (kbps >= 8000) return 10;   // fast link: fail fast, next chain is one call away
+            if (kbps >= 2000) return 15;   // typical 4G
+            if (kbps >= 500) return 25;    // slow
+            return 30;                     // 2G / poor signal
+        } catch (Throwable e) {
+            return 20;
+        }
+    }
+
+    /**
+     * How long the most recent successful resolution took, in milliseconds.
+     *
+     * The link's advertised bandwidth is a poor guide here: WiFi reports its PHY rate
+     * (tens of Mbps) while the real throughput on a crowded 2.4 GHz network can be a
+     * tenth of that, and the cost of a resolution is dominated by yt-dlp's own work
+     * rather than by the bytes it moves. What actually predicts the next wait is how
+     * long the last one took, so that is what the depth is based on.
+     */
+    private static volatile long lastResolveMs = 0;
+
+    /**
+     * How many rows of a fresh list to resolve ahead of the first tap.
+     *
+     * Each warm row is a separate yt-dlp process, and on a phone several of them at
+     * once contend for the same CPU, so warming too many makes every one of them
+     * slower — the opposite of the intent. The depth therefore follows the measured
+     * cost: when resolutions are quick, four rows are nearly free and the third and
+     * fourth tap become instant too; when they are slow, one row is warmed and the
+     * rest of the bandwidth is left to the song the user is already hearing.
+     */
+    public static int prewarmDepth(Context context) {
+        long last = lastResolveMs;
+        if (last <= 0) {
+            // Nothing measured yet: start conservative and let the first result tune it.
+            return 2;
+        }
+        if (last <= 4000) return 4;    // quick link: warm four rows
+        if (last <= 8000) return 3;
+        if (last <= 15000) return 2;
+        return 1;                      // slow: one row, keep the CPU for playback
+    }
+
     private static String downloadInto(Context context, Track track, Listener listener,
                                        Task job, File work) throws Exception {
+        final long tTrackStart = android.os.SystemClock.elapsedRealtime();
         String query = track.searchQuery();
         if (query.trim().isEmpty()) throw new Failure("search", "Track has no title");
         report(listener, 2, "Searching");
@@ -229,6 +532,10 @@ public final class DownloadEngine {
         // the connection is poor, and the last one runs with a single fragment and long
         // timeouts. Failing a track that would have finished on attempt four is worse than
         // spending one more round on it.
+        // Started once, before the retry loop, so a retry does not restart the fetch and the
+        // cover is usually resolved by the time the transfer finishes. Measured without this:
+        // 4.5 s and 8.8 s spent waiting on a decorative image after the song had arrived.
+        final java.util.concurrent.Future<byte[]> artFuture = prefetchArt(track);
         for (int attempt = 0; attempt < 4 && mp3 == null; attempt++) {
             clear(work);
             try {
@@ -255,34 +562,51 @@ public final class DownloadEngine {
         if (mp3 == null) throw lastFailure == null ? new Failure("download", "Download failed") : lastFailure;
 
         job.check();
+        final long afterFetch = android.os.SystemClock.elapsedRealtime();
         // The post-processing stages own the top of the bar: conversion ends at 92, tagging
         // and saving fill the rest. Every mark is lifted above the high-water value so no
         // stage can pull the number back down.
         highWater[0] = Math.max(highWater[0], 92);
         report(listener, highWater[0], "Tagging");
         byte[] art = null;
-        if (track.coverUrl != null && !track.coverUrl.isEmpty()) {
-            art = Net.bytes(track.coverUrl);
-            if (art != null && art.length < 1024) art = null;
+        final long tArtStart = android.os.SystemClock.elapsedRealtime();
+        try {
+            // Usually already resolved: the transfer took longer than the fetch did.
+            art = artFuture.get(4, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Throwable e) {
+            // A cover is decoration. If it is late or missing the song is still saved; the
+            // row simply has no embedded artwork.
+            art = null;
         }
+        if (art != null && art.length < 1024) art = null;
+        final long artMs = android.os.SystemClock.elapsedRealtime() - tArtStart;
+        final long tTagStart = android.os.SystemClock.elapsedRealtime();
         try {
             Id3Writer.tag(mp3, track.title, track.artist, track.album, art);
         } catch (Throwable e) {
             Log.w(TAG, "tagging failed", e);
         }
+        final long tagMs = android.os.SystemClock.elapsedRealtime() - tTagStart;
 
         job.check();
         highWater[0] = Math.max(highWater[0], 95);
         report(listener, highWater[0], "Saving to Music/Cartify");
         String uri;
+        final long tImportStart = android.os.SystemClock.elapsedRealtime();
         try {
             uri = LibraryStore.importFile(context, mp3, track.title, track.artist, track.album);
         } catch (Throwable e) {
             throw new Failure("save", "Could not save to storage: " + describe(e));
         }
+        final long importMs = android.os.SystemClock.elapsedRealtime() - tImportStart;
         //noinspection ResultOfMethodCallIgnored
         mp3.delete();
         report(listener, 100, "Done");
+        long finish = android.os.SystemClock.elapsedRealtime();
+        Log.i(TAG, "phase tagsave=" + (finish - afterFetch) + "ms total="
+                + (finish - tTrackStart) + "ms title=\"" + track.title + "\""
+                + " artFetch=" + artMs + "ms tag=" + tagMs + "ms import=" + importMs + "ms"
+                + " artBytes=" + (art == null ? 0 : art.length));
         return uri;
     }
 
@@ -301,7 +625,33 @@ public final class DownloadEngine {
      * manifest carries no audio-only stream; the retry loop switches chain on a
      * format failure so a track that failed once gets a genuinely different client.
      */
+    /**
+     * Client order used when only a playable url is wanted, not a file.
+     *
+     * Deliberately different from {@link #CLIENT_CHAINS}: that order is tuned for
+     * downloads, where an audio-only format matters because the bytes are kept forever.
+     * A stream is thrown away when the song ends, so the only thing that matters is how
+     * fast an address comes back. Measured on the same tracks, android,ios answers in
+     * about 21 s against 27 s for tv_embedded, and the muxed format it returns plays
+     * fine through MediaPlayer, so it goes first here and tv_embedded stays as the
+     * fallback that is known to expose audio-only streams.
+     */
+    private static final String[] STREAM_CHAINS = {
+            "android,ios",
+            "tv_embedded",
+            "ios,web",
+            "web,android",
+            "web,android,ios,mweb",
+    };
+
     private static final String[] CLIENT_CHAINS = {
+            // tv_embedded is first because it is the only client probed that exposes
+            // audio-only streams (formats 139/140/251). android and ios expose none at all:
+            // a format listing on those chains shows zero "audio only" rows, so
+            // "bestaudio" matched nothing and every download silently fell through to
+            // muxed format 18 - a 360p MP4 whose video ffmpeg then discarded. Measured on
+            // one track: 5.32 MiB fetched for a 2.1 MB mp3.
+            "tv_embedded",
             "android,ios",
             "ios,web",
             "web,android",
@@ -325,24 +675,36 @@ public final class DownloadEngine {
         // a fraction of it: 8 -> 4 -> 2 turns "times out forever" into "finishes slowly".
         int fragments = Math.max(1, fragmentsForSpeed(context) >> attempt);
 
+        // Logged so a slow download can be diagnosed afterwards. Without the client
+        // actually used and the fragment count there is no way to tell a bad network
+        // from a bad client choice, which is exactly the question a 16 s track raises.
+        Log.i(TAG, "attempt " + (attempt + 1) + " client=" + clientChain
+                + " fragments=" + fragments + " quality=" + DownloadQuality.get(context));
+
         // Stages re-report a fixed mark (4 matching, 90 tagging, 95 saving). On a retry the
         // high-water mark is already far past those, so reporting them raw made the row
         // fall back to 4 and then climb again — visible as the number jumping around.
         int stage = Math.max(4, Math.min(85, highWater[0]));
         report(listener, stage, "Matching track");
+        // Phase timing: a 47 s track needs to say WHICH stage owns the time. Search,
+        // transfer and conversion are three very different problems with three very
+        // different fixes, and without these marks the total is the only number available.
+        final long tPickStart = android.os.SystemClock.elapsedRealtime();
         String picked = attempt == 0 ? PICKED.get(query) : null;
         if (picked == null) {
             picked = pickCandidate(query, track, task);
             PICKED.put(query, picked);
         }
         task.check();
+        Log.i(TAG, "phase pick=" + (android.os.SystemClock.elapsedRealtime() - tPickStart)
+                + "ms query=\"" + query + "\"");
 
         YoutubeDLRequest request = new YoutubeDLRequest(picked);
         // Format selection must never be empty. A single client can hand back a video
         // whose only streams are video+audio muxed, and "bestaudio/best" then matches
         // nothing at all: "Requested format is not available". The trailing "best" and
         // the wildcard keep a playable stream available on every client.
-        request.addOption("-f", "bestaudio*/best");
+        request.addOption("-f", "bestaudio/best");
         // Sort by audio bitrate, highest first, so the chosen stream is the best
         // the source offers instead of an arbitrary format id.
         request.addOption("-S", "abr,acodec:opus");
@@ -359,6 +721,12 @@ public final class DownloadEngine {
                 "youtube:player_client=" + clientChain);
 
         request.addOption("--no-warnings");
+        // Without --newline yt-dlp redraws its progress bar with carriage returns on one
+        // line. The binding parses that stream line by line, so a whole transfer can arrive
+        // as a single "0% ... 100%" update or be dropped entirely - measured as peakRate=0
+        // with no intermediate callbacks at all, which is why the row sat at one percentage
+        // for the entire download. --newline emits one line per update.
+        request.addOption("--newline");
         request.addOption("--no-mtime");
         request.addOption("--extract-audio");
         request.addOption("--audio-format", "mp3");
@@ -403,9 +771,11 @@ public final class DownloadEngine {
         final String processId = "cartify-" + System.nanoTime() + "-" + attempt;
         task.bind(processId);
         YoutubeDLResponse response;
+        final long tTransferStart = android.os.SystemClock.elapsedRealtime();
+        final ProgressFunction progressFn =
+                new ProgressFunction(listener, task, highWater, tTransferStart);
         try {
-            response = YoutubeDL.getInstance().execute(request, processId,
-                    new ProgressFunction(listener, task, highWater));
+            response = YoutubeDL.getInstance().execute(request, processId, progressFn);
         } catch (Throwable e) {
             task.check();
             // The library reports most failures as a non-zero exit code, but some are
@@ -434,6 +804,11 @@ public final class DownloadEngine {
             throw new Failure("download", "Could not download this track (" + msg + ")", stale);
         }
         task.bind("");
+        final long transferMs = android.os.SystemClock.elapsedRealtime() - tTransferStart;
+        Log.i(TAG, "phase transfer=" + transferMs + "ms client=" + clientChain
+                + " fragments=" + fragments + " exit=" + response.getExitCode()
+                + " peakRate=" + (progressFn == null ? -1 : progressFn.bestRate) + "pct/s");
+        logDownloadSummary(response);
         task.check();
         if (response.getExitCode() != 0) {
             String err = errorLine(response.getErr());
@@ -471,6 +846,11 @@ public final class DownloadEngine {
         }
         report(listener, 94, "Converting");
         File mp3 = findMp3(work);
+        if (mp3 != null) {
+            // Bytes plus the client name is the number that shows whether the
+            // requested quality was honoured, without needing a log of the format id.
+            Log.i(TAG, "downloaded " + mp3.length() + " bytes, client=" + clientChain);
+        }
         if (mp3 == null) throw new Failure("convert", "No MP3 was produced");
         report(listener, 97, "Tagging");
         return mp3;
@@ -526,6 +906,36 @@ public final class DownloadEngine {
      * as if the song did not exist. Dropping the artist, then trimming to the first few
      * title words, keeps a search in play when the exact string does not.
      */
+    /** Single daemon thread for cover prefetches; a download is one cover at a time. */
+    private static final java.util.concurrent.ExecutorService ART_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "cartify-art-prefetch");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
+     * Starts fetching a track's cover in the background.
+     *
+     * Returns a future that resolves to the raw image bytes, or null when there is no cover
+     * or the fetch failed. Callers must not block on this longer than they can afford: the
+     * whole point is that the download usually outlasts it.
+     */
+    private static java.util.concurrent.Future<byte[]> prefetchArt(Track track) {
+        if (track == null || track.coverUrl == null || track.coverUrl.isEmpty()) {
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
+        }
+        final String url = track.coverUrl;
+        return ART_POOL.submit(() -> {
+            try {
+                // Same short budget as before: a cover must never hold up a save.
+                return Net.bytes(url, 4000, 4000);
+            } catch (Throwable e) {
+                return null;
+            }
+        });
+    }
+
     private static String pickCandidate(String query, Track track, Task task) throws Failure {
         try {
             return pickCandidateOnce(query, track, task);
@@ -782,12 +1192,27 @@ public final class DownloadEngine {
             boolean inCandidate = title.contains(marker) || channel.contains(marker);
             boolean inWanted = asked.contains(marker);
             if (!inCandidate || inWanted) continue;
-            // A lyrics upload is the same recording in worse packaging, so it loses less
-            // than a genuinely different performance would.
+            // A plain lyrics upload is the same recording in worse packaging, so it loses
+            // less than a genuinely different performance would.
             boolean packagingOnly = marker.equals("lyrics") || marker.equals("lyric video")
-                    || marker.equals("legendado") || marker.equals("tradução")
-                    || marker.equals("traducao") || marker.equals("letra")
-                    || marker.equals("paroles") || marker.equals("subtitulado");
+                    || marker.equals("legendado") || marker.equals("letra")
+                    || marker.equals("paroles") || marker.equals("subtitulado")
+                    || marker.equals("video oficial legendado");
+            // A TRANSLATED lyrics upload is not packaging. The words on screen are a
+            // different language, which means the video was re-cut to fit them and the audio
+            // is routinely pitched or time-stretched away from the master. It used to sit in
+            // the packaging branch above, and on 4 November 2026 the phone accepted
+            //   "Canyon City - Fix You (TRADUÇÃO: PT - BR)"
+            // for a Fix You download: the title and artist alone scored identity 50, which
+            // cleared IDENTITY_ACCEPT_SCORE and skipped the length check entirely. Treating
+            // it as a different recording is the honest answer — if the user wanted the
+            // Portuguese version they would have searched for it.
+            boolean translated = isTranslatedMarker(marker);
+            if (translated) {
+                score -= 40;
+                identity = 0;
+                continue;
+            }
             score -= packagingOnly ? 22 : 40;
             if (!packagingOnly) identity = 0;
         }
@@ -837,11 +1262,34 @@ public final class DownloadEngine {
             // A lyrics video is a still image over audio that has usually been re-encoded
             // at least once. It scored 88 against 78 for the official audio in testing,
             // which is exactly backwards: it is a re-upload, not the source.
-            "lyrics", "lyric video", "legendado", "tradução", "traducao",
-            "letra", "paroles", "subtitulado", "video oficial legendado",
+            "lyrics", "lyric video", "legendado", "letra", "paroles", "subtitulado",
+            "video oficial legendado",
+            // Explicitly TRANSLATED lyric videos are a different language on screen, which
+            // normally means the audio was re-cut to fit it. See isTranslatedMarker().
+            "tradução", "traducao", "traducido", "traduzione", "traduit", "tradotto",
+            "übersetzt", "übersetzung",
             // Concert and festival captures are never the studio recording.
             "live at", "pinkpop", "glastonbury", "concert", "festival",
     };
+
+    /**
+     * True when the marker names an explicitly *translated* lyrics upload.
+     *
+     * A plain lyric video is the same recording in worse packaging, so it only loses 22
+     * points and keeps its identity. A translated one is held to the stricter rule: the
+     * words on screen are another language, which normally means the video was re-cut and
+     * the audio pitched or time-stretched away from the master.
+     *
+     * Only unambiguous "translated" words are listed. Words such as "letra", "legendado"
+     * or "paroles" mean "lyrics" or "subtitled" and are routinely put on uploads of the
+     * original song, so treating them as translations would reject good matches.
+     */
+    private static boolean isTranslatedMarker(String marker) {
+        return marker.equals("tradução") || marker.equals("traducao")
+                || marker.equals("traducido") || marker.equals("traduzione")
+                || marker.equals("traduit") || marker.equals("tradotto")
+                || marker.equals("übersetzt") || marker.equals("übersetzung");
+    }
 
     /**
      * Fraction of the wanted words that appear in the candidate, 0-1.
@@ -958,6 +1406,53 @@ public final class DownloadEngine {
      * conversion owns 92..99, and the emitted value can never decrease, so a repeated or
      * out-of-order callback leaves the bar where it is instead of snapping it back.
      */
+    /**
+     * Logs the few yt-dlp lines that actually explain a transfer.
+     *
+     * A wall-clock total cannot distinguish a slow network from a bad client choice: 7 MB
+     * in 17 s is about 400 KB/s, which is plausible for either. yt-dlp itself reports the
+     * chosen stream and a final "at NNN KiB/s" speed, and that speed is the number that
+     * separates the two cases. Only lines that carry that information are kept, capped in
+     * count and length, so the log stays readable in a bug report.
+     */
+    private static void logDownloadSummary(YoutubeDLResponse response) {
+        String out = response.getOut() == null ? "" : response.getOut();
+        String err = response.getErr() == null ? "" : response.getErr();
+        StringBuilder sb = new StringBuilder();
+        int kept = 0;
+        for (String raw : (out + "\n" + err).split("\n")) {
+            String line = raw.trim();
+            if (line.isEmpty()) continue;
+            // Format selection is the one line that explains the byte count: a muxed
+            // video container carries megabytes of video that are thrown away by the
+            // audio extraction, so knowing the format id is knowing whether the transfer
+            // was ever going to be small.
+            boolean useful = line.contains("[download]") || line.contains("[ExtractAudio]")
+                    || line.contains("[ffmpeg]") || line.contains("Destination:")
+                    || line.contains("format(s):") || line.contains("Downloading 1 format");
+            if (!useful) continue;
+            if (kept >= 6) break;
+            kept++;
+            if (sb.length() > 0) sb.append(" | ");
+            sb.append(line.length() > 140 ? line.substring(0, 140) : line);
+        }
+        if (sb.length() > 0) {
+            Log.i(TAG, "yt-dlp: " + sb);
+        } else {
+            Log.i(TAG, "yt-dlp: no download summary lines");
+        }
+    }
+
+    /**
+     * Matches yt-dlp's transfer line, e.g. "  0.4% of 3.56MiB at 1.75MiB/s ETA 00:02".
+     *
+     * Only the leading percentage is captured. The size and speed are useful for logs but
+     * the bar needs the percentage, and taking it from the text is the only reliable source
+     * here - the callback's own Float stayed at -1 for the whole transfer.
+     */
+    private static final java.util.regex.Pattern PROGRESS_LINE =
+            java.util.regex.Pattern.compile("([0-9]+(?:\\.[0-9]+)?)%\\s+of\\s+");
+
     private static final class ProgressFunction implements Function3<Float, Long, String, Unit> {
         private final Listener listener;
         private final Task task;
@@ -966,17 +1461,44 @@ public final class DownloadEngine {
         private int lastEmitted = -1;
         /** Progress callbacks seen while yt-dlp is still resolving (progress == -1). */
         private int extractTicks;
+        /** When the first real byte arrived; 0 until then. */
+        private long firstByteAt;
+        /** When yt-dlp last reported -1, i.e. the end of the extraction phase. */
+        private long extractEndedAt;
+        /** Percentage and clock from the previous callback, for a rate estimate. */
+        private int lastPct = -1;
+        private long lastPctAt;
+        /** Fastest percentage-per-second seen, as a whole number scaled by 100. */
+        private int bestRate = 0;
 
-        ProgressFunction(Listener listener, Task task, int[] highWater) {
+        private final long transferStartAt;
+
+        ProgressFunction(Listener listener, Task task, int[] highWater, long transferStartAt) {
             this.listener = listener;
             this.task = task;
             this.highWater = highWater;
+            this.transferStartAt = transferStartAt;
         }
 
         @Override
         public Unit invoke(Float progress, Long eta, String line) {
             if (task != null && task.isCancelled()) return Unit.INSTANCE;
             int raw = progress == null ? -1 : Math.round(progress);
+            // The Float parameter does not carry intermediate values for this pipeline: it
+            // arrived as -1 throughout extraction and then jumped straight to the end, so
+            // the row sat on one number for the whole transfer (measured peakRate=0 across
+            // four downloads). The percentage IS present in the line text - "  0.4% of
+            // 3.56MiB at 1.75MiB/s" - so it is parsed from there when the Float is silent.
+            if (raw < 0 && line != null) {
+                java.util.regex.Matcher m = PROGRESS_LINE.matcher(line);
+                if (m.find()) {
+                    try {
+                        raw = Math.round(Float.parseFloat(m.group(1)));
+                    } catch (NumberFormatException ignored) {
+                        raw = -1;
+                    }
+                }
+            }
 
             // yt-dlp reports -1 while it is still resolving the media: running the
             // JavaScript player challenge, picking a format and opening the stream. That
@@ -985,6 +1507,7 @@ public final class DownloadEngine {
             // moved once the (very fast) transfer began. Reporting it as its own creeping
             // stage is what makes the wait legible.
             if (raw < 0) {
+                extractEndedAt = android.os.SystemClock.elapsedRealtime();
                 if (listener != null) {
                     // Creep slowly inside 6..14 so the row visibly moves without ever
                     // pretending the transfer has started.
@@ -996,6 +1519,30 @@ public final class DownloadEngine {
             }
 
             int pct = Math.max(0, Math.min(100, raw));
+            // Rate estimate: percentage gained per second between two callbacks. This is
+            // size-independent, so it works before the total is known and stays comparable
+            // across tracks. A link that is starving shows a rate near zero while yt-dlp is
+            // still "downloading", which is exactly the case the OS bandwidth estimate
+            // misses - it reports the radio's capability, not what is actually arriving.
+            long nowMs = android.os.SystemClock.elapsedRealtime();
+            if (lastPct >= 0 && pct > lastPct) {
+                long dt = nowMs - lastPctAt;
+                if (dt > 200) {
+                    int rate = (int) ((pct - lastPct) * 100000L / dt);
+                    if (rate > bestRate) bestRate = rate;
+                }
+            }
+            lastPct = pct;
+            lastPctAt = nowMs;
+            if (firstByteAt == 0L) {
+                firstByteAt = android.os.SystemClock.elapsedRealtime();
+                // The single number that matters for diagnosis: how much of the wall time
+                // was spent resolving the media versus moving bytes. A 17 s transfer is a
+                // different problem depending on which half it lands in.
+                android.util.Log.i("Cartify", "phase extract="
+                        + (extractEndedAt == 0L ? -1 : (firstByteAt - extractEndedAt))
+                        + "ms beforeFirstByte=" + (firstByteAt - transferStartAt) + "ms");
+            }
             extractTicks = 0;
             // A retry starts its own 0..100 counter, so it is lifted above the best value
             // the previous attempt reached. The floor is capped at the band ceiling: once

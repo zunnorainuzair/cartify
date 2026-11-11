@@ -16,6 +16,9 @@ import java.util.List;
 /** The play queue: tap to jump, X to remove, current track highlighted. */
 public class QueueAdapter extends RecyclerView.Adapter<QueueAdapter.VH> {
 
+    /** Artwork width for this list's rows, in pixels. Rows are small; full covers are not. */
+    private static final int ROW_ART_PX = 200;
+
     public interface Actions {
         void onPick(int index);
 
@@ -60,7 +63,7 @@ public class QueueAdapter extends RecyclerView.Adapter<QueueAdapter.VH> {
                 .getColor(isCurrent ? R.color.accent : R.color.text_primary));
         h.artist.setText(t.artist);
         h.now.setVisibility(isCurrent ? View.VISIBLE : View.GONE);
-        Art.load(h.itemView.getContext(), t, h.art);
+        Art.load(h.itemView.getContext(), t, h.art, null, ROW_ART_PX);
         h.itemView.setOnClickListener(v -> actions.onPick(h.getAdapterPosition()));
         h.remove.setOnClickListener(v -> actions.onRemove(h.getAdapterPosition()));
     }

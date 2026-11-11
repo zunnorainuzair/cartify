@@ -36,10 +36,12 @@ import java.util.regex.Pattern;
 public final class Lyrics {
 
     private static final String TAG = "Cartify";
-    // v3: v2 cached a French rap sheet under a Punjabi track, because the old matcher
-    // accepted any same-titled song whose length happened to be close. The poisoned
-    // entries are simply left behind in the old preference file.
-    private static final String PREFS = "cartify_lyrics_v3";
+    // v4: v3 keyed the cache on artist+title only, and its matcher never looked at the
+    // track NAME at all. Two different songs by the same artist therefore shared one
+    // cache slot, and one song's sheet was displayed under the other - the "intermixed
+    // lyrics" report. The key now carries the duration and the matcher requires the
+    // returned track name to be this song. Old entries are simply left behind.
+    private static final String PREFS = "cartify_lyrics_v5";
     private static final String UA = "Cartify/1.0 (Android music player)";
     private static final Pattern TIME = Pattern.compile("\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?]");
 
@@ -62,21 +64,59 @@ public final class Lyrics {
     private Lyrics() {
     }
 
-    private static String key(String artist, String title) {
+    /**
+     * Cache identity: artist, title AND length.
+     *
+     * Artist+title alone is not an identity. A soundtrack artist such as "Pritam" has
+     * dozens of songs, and two uploads can even share a title while being different
+     * recordings; either way one entry was served for the other, which is exactly how
+     * one song's lines appeared under a different song. The length is coarse (whole
+     * seconds) so a re-encode does not miss the cache, but distinct recordings differ.
+     */
+    private static String key(String artist, String title, long durationMs) {
+        return key(null, artist, title, durationMs);
+    }
+
+    /**
+     * Cache identity, preferring the song's own unique id when there is one.
+     *
+     * Artist, title and length still cannot separate two uploads of a song that share
+     * all three (a re-record, two mixes of a soundtrack cue). Every Track that comes from
+     * a catalogue now carries its ISRC/track id, and that IS unique per recording, so it
+     * leads the key whenever it is present.
+     */
+    private static String key(Track track, String artist, String title, long durationMs) {
+        String id = track == null || track.id == null ? "" : track.id.trim().toLowerCase(Locale.US);
+        if (!id.isEmpty()) return "id:" + id;
         return (artist == null ? "" : artist.trim().toLowerCase(Locale.US))
-                + "|" + (title == null ? "" : title.trim().toLowerCase(Locale.US));
+                + "|" + (title == null ? "" : title.trim().toLowerCase(Locale.US))
+                + "|" + (durationMs > 0 ? (durationMs / 1000L) : 0L);
     }
 
     /** @return cached LRC text, "" when nothing was found, or null when never looked up. */
-    public static String cached(Context context, String artist, String title) {
+    public static String cached(Context context, String artist, String title, long durationMs) {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getString(key(artist, title), null);
+                .getString(key(artist, title, durationMs), null);
+    }
+
+    /** Same lookup, keyed on the track's own id when it has one. */
+    public static String cached(Context context, Track track) {
+        if (track == null) return null;
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(key(track, track.artist, track.title, track.durationMs), null);
     }
 
     /** Drops a cached answer so the next lookup asks the service again. */
-    public static void forget(Context context, String artist, String title) {
+    public static void forget(Context context, String artist, String title, long durationMs) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .remove(key(artist, title)).apply();
+                .remove(key(artist, title, durationMs)).apply();
+    }
+
+    /** Drops the cached answer for a track, under the id-first key. */
+    public static void forget(Context context, Track track) {
+        if (track == null) return;
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .remove(key(track, track.artist, track.title, track.durationMs)).apply();
     }
 
     /**
@@ -88,14 +128,15 @@ public final class Lyrics {
      */
     public static String fetch(Context context, Track track) {
         if (track == null) return null;
-        String existing = cached(context, track.artist, track.title);
+        String existing = cached(context, track);
         if (existing != null) return existing.isEmpty() ? null : existing;
 
         Result result = request(track);
         if (!result.definitive) return result.lrc;
 
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit().putString(key(track.artist, track.title), result.lrc == null ? "" : result.lrc)
+                .edit().putString(key(track, track.artist, track.title, track.durationMs),
+                        result.lrc == null ? "" : result.lrc)
                 .apply();
         return result.lrc;
     }
@@ -214,10 +255,17 @@ public final class Lyrics {
                     if (!isRealLyrics(synced)) continue;
                     // The decisive filter: a different artist means a different song.
                     if (!sameArtist(track.artist, o.optString("artistName", ""))) continue;
+                    // And the entry must actually be this song. Without this check the
+                    // search ran on the title but nothing verified what came back, so any
+                    // song by the same artist that happened to be a similar length was
+                    // accepted - the "one song, another song's lyrics" bug.
+                    if (!sameTitle(track.title, o.optString("trackName", ""))) continue;
                     long durMs = Math.round(o.optDouble("duration", 0) * 1000d);
                     if (!lengthFits(track.durationMs, durMs)) continue;
                     if (!timingFits(synced, track.durationMs)) continue;
 
+                    // Prefer the closest length, then the closest title, so two versions
+                    // of the same song do not flip-flop between runs.
                     long cost = track.durationMs > 0 && durMs > 0
                             ? Math.abs(durMs - track.durationMs)
                             : 0L;
@@ -248,10 +296,61 @@ public final class Lyrics {
         if (a.isEmpty()) return true;   // no artist metadata: nothing to check against
         Set<String> b = artistWords(theirs);
         if (b.isEmpty()) return false;
+        // A single shared word is not agreement. "Karan Aujla" and "Karan Singh" share
+        // one word and are different artists; the old any-word rule accepted them, and
+        // with a similar length that was enough to display the wrong song's lines.
+        // Requiring most of the shorter name settles the common cases: "Karan Aujla,
+        // DIVINE" vs "Karan Aujla" agrees, "Ed Sheeran" vs "Ed Sheeran feat. Beyonce"
+        // agrees, and the one-word coincidence does not.
+        int shared = 0;
         for (String w : a) {
-            if (b.contains(w)) return true;
+            if (b.contains(w)) shared++;
         }
-        return false;
+        int smaller = Math.min(a.size(), b.size());
+        return shared >= Math.max(1, smaller - (smaller > 2 ? 1 : 0)) && shared * 2 >= smaller;
+    }
+
+    /**
+     * True when the database entry's track name is this song.
+     *
+     * Compared after stripping the qualifiers both sides like to add ("(From ...)",
+     * "- Remastered", "feat. ..."), then as word sets so punctuation and a stray
+     * "(Official Video)" do not reject a correct sheet. A title with no words in common
+     * is a different song, and that is the case this check exists for.
+     */
+    private static boolean sameTitle(String ours, String theirs) {
+        Set<String> a = titleWords(cleanTitle(ours));
+        if (a.isEmpty()) return true;   // no title to compare: the artist check stands
+        Set<String> b = titleWords(cleanTitle(theirs));
+        if (b.isEmpty()) return false;
+        // A single shared word is NOT the same title. "Kadi Te Has Bol" shares one word
+        // with a dozen other Punjabi tracks, and with the search relaxed to a title-only
+        // query that one word was enough to accept another song's sheet - the reported
+        // "some songs have each other's lyrics". Most of the shorter title must agree,
+        // exactly like the artist comparison, so a genuine variant ("... (Reprise)",
+        // "... - Remastered") still passes while a different song does not.
+        int shared = 0;
+        for (String w : a) {
+            if (b.contains(w)) shared++;
+        }
+        int smaller = Math.min(a.size(), b.size());
+        if (shared == 0) return false;
+        if (smaller == 1) return true;   // a one-word title can only be judged on itself
+        return shared >= smaller - 1 && shared * 2 >= smaller + 1;
+    }
+
+    private static Set<String> titleWords(String title) {
+        Set<String> out = new HashSet<>();
+        if (title == null) return out;
+        String cleaned = title.toLowerCase(Locale.US)
+                .replaceAll("[^\\p{L}\\p{N}]+", " ")
+                .trim();
+        for (String w : cleaned.split(" ")) {
+            if (w.length() < 2) continue;
+            if (ARTIST_NOISE.contains(w)) continue;
+            out.add(w);
+        }
+        return out;
     }
 
     private static Set<String> artistWords(String name) {

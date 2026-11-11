@@ -12,6 +12,86 @@
         android:paddingTop="14dp"
         android:paddingEnd="18dp">
 
+        <!-- Update banner: only visible when a newer release exists. It sits above every
+             tab so the user sees it wherever they are in the app, and the dot pulses so a
+             release that landed while the app was closed is not missed. -->
+        <LinearLayout
+            android:id="@+id/updateBanner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="10dp"
+            android:background="@drawable/bg_update_banner"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="12dp"
+            android:paddingTop="9dp"
+            android:paddingEnd="6dp"
+            android:paddingBottom="9dp"
+            android:visibility="gone">
+
+            <View
+                android:id="@+id/updateDot"
+                android:layout_width="9dp"
+                android:layout_height="9dp"
+                android:background="@drawable/bg_update_dot" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/updateBannerTitle"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:text="Update available"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/updateBannerSub"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="1dp"
+                    android:ellipsize="end"
+                    android:maxLines="1"
+                    android:text="Tap to update"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/updateBannerAction"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_badge"
+                android:paddingStart="12dp"
+                android:paddingTop="6dp"
+                android:paddingEnd="12dp"
+                android:paddingBottom="6dp"
+                android:text="Update"
+                android:textColor="@color/accent"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+
+            <ImageButton
+                android:id="@+id/updateBannerClose"
+                android:layout_width="30dp"
+                android:layout_height="30dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Dismiss update"
+                android:padding="7dp"
+                android:src="@drawable/ic_close"
+                android:tint="@color/text_tertiary" />
+        </LinearLayout>
+
         <!-- header -->
         <LinearLayout
             android:layout_width="match_parent"
@@ -113,6 +193,18 @@
                             android:textColor="@color/text_primary"
                             android:textColorHint="@color/text_tertiary"
                             android:textSize="13sp" />
+
+                        <!-- Appears only once there is something to clear. -->
+                        <ImageButton
+                            android:id="@+id/searchClear"
+                            android:layout_width="30dp"
+                            android:layout_height="30dp"
+                            android:background="?android:attr/selectableItemBackgroundBorderless"
+                            android:contentDescription="Clear search"
+                            android:padding="6dp"
+                            android:src="@drawable/ic_close"
+                            android:tint="@color/text_secondary"
+                            android:visibility="gone" />
 
                         <ImageButton
                             android:id="@+id/searchGo"
@@ -239,153 +331,125 @@
                         android:visibility="gone" />
                 </LinearLayout>
 
-                <LinearLayout
-                    android:id="@+id/collectionBar"
+
+
+                <!-- Last few searches, one tap to repeat. -->
+
+                <!--
+                    Results area: the shelf floats ABOVE the list instead of sitting in the
+                    column above it.
+
+                    Why it is an overlay and not a sibling: a sibling in the vertical stack
+                    physically steals height from the weighted list, so making it appear or
+                    disappear moved every row by its full height in one frame. That is what
+                    read as "it just vanishes" and as a jump. Here the list keeps a constant
+                    height and gets a top padding equal to the shelf, and the shelf is moved
+                    and faded with transforms only. Transforms run on the render thread, so
+                    the fade is smooth from the very first pixel of scroll and nothing ever
+                    re-lays-out while the finger is down.
+                -->
+                <FrameLayout
+                    android:id="@+id/resultsArea"
                     android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginBottom="10dp"
-                    android:background="@drawable/bg_glass"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal"
-                    android:padding="10dp"
-                    android:visibility="gone">
+                    android:layout_height="0dp"
+                    android:layout_weight="1">
 
-                    <FrameLayout
-                        android:layout_width="56dp"
-                        android:layout_height="56dp"
-                        android:background="@drawable/bg_cover">
-
-                        <ImageView
-                            android:id="@+id/collectionCover"
-                            android:layout_width="match_parent"
-                            android:layout_height="match_parent"
-                            android:contentDescription="Cover"
-                            android:scaleType="centerCrop" />
-                    </FrameLayout>
+                    <androidx.recyclerview.widget.RecyclerView
+                        android:id="@+id/list"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:clipToPadding="false"
+                        android:paddingBottom="150dp"
+                        android:scrollbars="none" />
 
                     <LinearLayout
-                        android:layout_width="0dp"
+                        android:id="@+id/shelfBlock"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginStart="12dp"
-                        android:layout_weight="1"
-                        android:orientation="vertical">
+                        android:background="@drawable/bg_shelf_fade"
+                        android:orientation="vertical"
+                        android:visibility="gone">
 
                         <TextView
-                            android:id="@+id/collectionName"
+                            android:id="@+id/recHeader"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:ellipsize="end"
-                            android:maxLines="2"
+                            android:layout_marginTop="6dp"
+                            android:text="More like this"
                             android:textColor="@color/text_primary"
                             android:textSize="15sp"
                             android:textStyle="bold" />
 
-                        <TextView
-                            android:id="@+id/collectionMeta"
+                        <androidx.recyclerview.widget.RecyclerView
+                            android:id="@+id/recRail"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:layout_marginTop="2dp"
-                            android:textColor="@color/text_secondary"
-                            android:textSize="12sp" />
+                            android:layout_marginTop="10dp"
+                            android:clipToPadding="false"
+                            android:orientation="horizontal"
+                            android:scrollbars="none" />
+
+                        <!-- Playlists from the same search. They live inside the shelf
+                             overlay rather than as a second overlay so they inherit its
+                             measured height, its fade and the list padding it applies,
+                             instead of duplicating that geometry a second time. -->
+                        <TextView
+                            android:id="@+id/playlistHeader"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="14dp"
+                            android:text="Playlists"
+                            android:textColor="@color/text_primary"
+                            android:textSize="15sp"
+                            android:textStyle="bold"
+                            android:visibility="gone" />
+
+                        <androidx.recyclerview.widget.RecyclerView
+                            android:id="@+id/playlistRail"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="10dp"
+                            android:clipToPadding="false"
+                            android:orientation="horizontal"
+                            android:scrollbars="none"
+                            android:visibility="gone" />
                     </LinearLayout>
 
-                    <Button
-                        android:id="@+id/downloadAllButton"
-                        android:layout_width="wrap_content"
-                        android:layout_height="44dp"
-                        android:background="@drawable/bg_play_button"
-                        android:minWidth="44dp"
-                        android:paddingStart="14dp"
-                        android:paddingEnd="14dp"
-                        android:stateListAnimator="@null"
-                        android:text="Download all"
-                        android:textAllCaps="false"
-                        android:textColor="@color/accent_ink"
-                        android:textSize="12sp"
-                        android:textStyle="bold" />
-                </LinearLayout>
-
-                <!-- Last few searches, one tap to repeat. -->
-                <HorizontalScrollView
-                    android:id="@+id/recentRow"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:clipToPadding="false"
-                    android:scrollbars="none"
-                    android:visibility="gone">
-
                     <LinearLayout
-                        android:id="@+id/recentChips"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:orientation="horizontal" />
-                </HorizontalScrollView>
-
-                <!-- Album-style shelf, the way Spotify home leads with artwork. -->
-                <TextView
-                    android:id="@+id/recHeader"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="14dp"
-                    android:text="Recommended for you"
-                    android:textColor="@color/text_primary"
-                    android:textSize="15sp"
-                    android:textStyle="bold" />
-
-                <androidx.recyclerview.widget.RecyclerView
-                    android:id="@+id/recRail"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:clipToPadding="false"
-                    android:orientation="horizontal"
-                    android:scrollbars="none" />
-
-                <androidx.recyclerview.widget.RecyclerView
-                    android:id="@+id/list"
-                    android:layout_width="match_parent"
-                    android:layout_height="0dp"
-                    android:layout_weight="1"
-                    android:clipToPadding="false"
-                    android:paddingBottom="150dp"
-                    android:scrollbars="none" />
-
-                <LinearLayout
-                    android:id="@+id/emptyState"
-                    android:layout_width="match_parent"
-                    android:layout_height="0dp"
-                    android:layout_weight="1"
-                    android:gravity="center"
-                    android:orientation="vertical"
-                    android:paddingBottom="60dp">
-
-                    <ImageView
-                        android:layout_width="46dp"
-                        android:layout_height="46dp"
-                        android:alpha="0.35"
-                        android:contentDescription="Empty"
-                        android:src="@drawable/ic_music_note"
-                        android:tint="@color/text_secondary" />
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="12dp"
-                        android:text="Nothing loaded yet"
-                        android:textColor="@color/text_primary"
-                        android:textSize="16sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:layout_width="260dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="6dp"
+                        android:id="@+id/emptyState"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
                         android:gravity="center"
-                        android:text="Open Spotify, tap Share, copy the link, then paste it above."
-                        android:textColor="@color/text_tertiary"
-                        android:textSize="12sp" />
-                </LinearLayout>
+                        android:orientation="vertical"
+                        android:paddingBottom="60dp">
+
+                        <ImageView
+                            android:layout_width="46dp"
+                            android:layout_height="46dp"
+                            android:alpha="0.35"
+                            android:contentDescription="Empty"
+                            android:src="@drawable/ic_music_note"
+                            android:tint="@color/text_secondary" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="12dp"
+                            android:text="Nothing loaded yet"
+                            android:textColor="@color/text_primary"
+                            android:textSize="16sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="260dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="6dp"
+                            android:gravity="center"
+                            android:text="Open Spotify, tap Share, copy the link, then paste it above."
+                            android:textColor="@color/text_tertiary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+                </FrameLayout>
             </LinearLayout>
 
             <!-- ======================= LIBRARY ======================= -->
@@ -639,7 +703,7 @@
                             android:layout_height="wrap_content"
                             android:layout_marginTop="6dp"
                             android:gravity="center"
-                            android:text="Make one, then add songs from your library — or straight from a playlist you downloaded."
+                            android:text="Make one, then add songs from your library â€” or straight from a playlist you downloaded."
                             android:textColor="@color/text_tertiary"
                             android:textSize="12sp" />
 
@@ -695,7 +759,7 @@
                         android:gravity="center"
                         android:paddingStart="12dp"
                         android:paddingEnd="12dp"
-                        android:text="Clear finished"
+                        android:text="Clear failed"
                         android:textColor="@color/text_secondary"
                         android:textSize="11sp" />
                 </LinearLayout>
@@ -844,6 +908,24 @@
                 android:src="@drawable/ic_next"
                 android:tint="@color/text_secondary" />
 
+            <!--
+                Save the song that is playing, from the collapsed bar.
+
+                The bar could pause, skip and open a menu, but keeping the song needed
+                the full player - and a stream that sounds right is exactly the moment to
+                keep it. This tap starts the download of the current track and leaves
+                playback alone, so a song can be saved while it plays.
+            -->
+            <ImageButton
+                android:id="@+id/miniDownload"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Download this song"
+                android:padding="6dp"
+                android:src="@drawable/ic_download"
+                android:tint="@color/text_secondary" />
+
             <!-- Shuffle, repeat, queue and playlist actions that will not fit inline. -->
             <ImageButton
                 android:id="@+id/miniMore"
@@ -957,7 +1039,6 @@
             android:layout_width="0dp"
             android:layout_height="46dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_pill_ghost"
             android:gravity="center"
             android:orientation="horizontal">
 
@@ -966,7 +1047,7 @@
                 android:layout_height="19dp"
                 android:contentDescription="Offline music"
                 android:src="@drawable/ic_library"
-                android:tint="@color/accent" />
+                android:tint="@color/text_secondary" />
 
             <TextView
                 android:layout_width="0dp"
@@ -976,7 +1057,7 @@
                 android:ellipsize="end"
                 android:maxLines="1"
                 android:text="Offline"
-                android:textColor="@color/accent"
+                android:textColor="@color/text_secondary"
                 android:textSize="11sp"
                 android:textStyle="bold" />
         </LinearLayout>
@@ -1076,7 +1157,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:elevation="30dp"
-        android:background="@color/bg_deep"
+        android:background="#FF000000"
         android:clickable="true"
         android:focusable="true" />
 </FrameLayout>

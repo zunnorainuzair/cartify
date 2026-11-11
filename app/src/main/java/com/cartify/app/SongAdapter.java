@@ -27,6 +27,9 @@ import java.util.Set;
  */
 public class SongAdapter extends RecyclerView.Adapter<SongAdapter.VH> {
 
+    /** Artwork width for this list's rows, in pixels. Rows are small; full covers are not. */
+    private static final int ROW_ART_PX = 200;
+
     public interface Actions {
         void onPlay(int index);
 
@@ -376,7 +379,7 @@ public class SongAdapter extends RecyclerView.Adapter<SongAdapter.VH> {
         h.title.setTextColor(h.itemView.getContext()
                 .getColor(isCurrent ? R.color.accent : R.color.text_primary));
 
-        Art.load(h.itemView.getContext(), t, h.art);
+        Art.load(h.itemView.getContext(), t, h.art, null, ROW_ART_PX);
         loadRowBackdrop(h, t);
 
         h.itemView.setOnClickListener(v -> {
@@ -480,6 +483,28 @@ public class SongAdapter extends RecyclerView.Adapter<SongAdapter.VH> {
      * Decoding and blurring run on a shared executor; the holder's tag holds the key the
      * bitmap belongs to so a recycled row never shows the previous song's wash.
      */
+    /**
+     * Bounded cache of row washes, keyed by artwork key.
+     *
+     * Every row used to blur its own artwork into a fresh bitmap and hand it straight to an
+     * ImageView, with nothing caching or releasing it. Scrolling a large library therefore
+     * created a new GPU texture per row visited: GPU memory reached ~174 MB and total PSS
+     * ~325 MB, which on a low-end phone is a one-way trip to the low-memory killer.
+     *
+     * A wash is small and purely decorative, so a modest LRU is enough: revisiting a row is
+     * then free, and the cap keeps a long scroll bounded.
+     */
+    private static final android.util.LruCache<String, Bitmap> WASH =
+            new android.util.LruCache<String, Bitmap>(8 * 1024 * 1024) {
+                @Override
+                protected int sizeOf(String key, Bitmap value) {
+                    return value.getByteCount();
+                }
+            };
+
+    /** Height the wash is rendered at: enough to fill a 68dp row on a dense screen. */
+    private static final int WASH_H = 160;
+
     private void loadRowBackdrop(VH h, Track t) {
         final String key = Art.key(t);
         if (key.isEmpty()) {
@@ -489,12 +514,29 @@ public class SongAdapter extends RecyclerView.Adapter<SongAdapter.VH> {
         }
         if (key.equals(h.backdrop.getTag())) return;
         h.backdrop.setTag(key);
+
+        Bitmap hit = WASH.get(key);
+        if (hit != null) {
+            h.backdrop.setImageBitmap(hit);
+            return;
+        }
+
         final android.content.Context app = h.itemView.getContext().getApplicationContext();
         final ImageView target = h.backdrop;
         BLUR.execute(() -> {
             Bitmap cached = Art.peek(t);
-            final Bitmap wash = Blur.of(cached != null ? cached : Art.full(app, t), 2);
+            Bitmap src = cached != null ? cached : Art.full(app, t);
+            if (src == null) return;
+            // Shrink before blurring: Blur only needs 48px of width internally, so handing
+            // it a full cover just allocates a large temporary for no visible gain.
+            int w = Math.max(1, Math.round(WASH_H * (float) src.getWidth() / src.getHeight()));
+            Bitmap small = src.getWidth() > w
+                    ? Bitmap.createScaledBitmap(src, w, WASH_H, true)
+                    : src;
+            final Bitmap wash = Blur.of(small, 2);
+            if (small != src) small.recycle();
             if (wash == null) return;
+            WASH.put(key, wash);
             target.post(() -> {
                 if (!key.equals(target.getTag())) return;
                 target.setImageBitmap(wash);

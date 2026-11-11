@@ -16,5 +16,5 @@
     <color name="text_secondary">#A3C4AE</color>
     <color name="text_tertiary">#6E8A77</color>
     <color name="danger">#E7A6A0</color>
-    <color name="ic_launcher_background">#000A02</color>
+    <color name="ic_launcher_background">#000000</color>
 </resources>

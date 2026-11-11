@@ -64,6 +64,8 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
     private View lyricsPanel;
     /** Zero-height slot directly under the artwork that the lyric sheet grows into. */
     private View lyricsHost;
+    private View lyricsListHost;
+    private View lyricsFade;
     private View artCard;
     private View topSpace;
     private View bottomSpace;
@@ -74,6 +76,7 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
     private boolean fromSwipe;
     private TextView pillText;
     private ImageButton playerMore;
+    private ImageButton playerDownload;
     private final java.util.concurrent.ExecutorService io =
             java.util.concurrent.Executors.newSingleThreadExecutor();
     private String lyricsFor = "";
@@ -88,6 +91,18 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
             main.postDelayed(this, 250);
         }
     };
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        AppLifecycle.onActivityStarted();
+    }
+
+    @Override
+    protected void onStop() {
+        AppLifecycle.onActivityStopped();
+        super.onStop();
+    }
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -121,13 +136,19 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         lyricsList = findViewById(R.id.lyricsList);
         lyricsPanel = findViewById(R.id.lyricsPanel);
         lyricsHost = findViewById(R.id.lyricsHost);
+        lyricsListHost = findViewById(R.id.lyricsListHost);
+        lyricsFade = findViewById(R.id.lyricsFade);
         artCard = findViewById(R.id.artCard);
         topSpace = findViewById(R.id.topSpace);
         bottomSpace = findViewById(R.id.bottomSpace);
         pillText = findViewById(R.id.pillText);
         playerMore = findViewById(R.id.playerMore);
+        playerDownload = findViewById(R.id.playerDownload);
         findViewById(R.id.pillQueue).setOnClickListener(v -> toggleQueue());
         playerMore.setOnClickListener(v -> showTrackMenu());
+        // Saving the song while it plays. The player is where the user is most likely to
+        // decide to keep a stream, so it must not require the overflow menu.
+        playerDownload.setOnClickListener(v -> downloadCurrentTrack());
         // The reference player opens on the artwork card; a small rise-in sells the entrance.
         pager.setAlpha(0f);
         pager.setScaleX(0.94f);
@@ -138,11 +159,11 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         findViewById(R.id.lyricsRetry).setOnClickListener(v -> {
             Track current = playback.current();
             if (current == null) return;
-            Lyrics.forget(this, current.artist, current.title);
+            Lyrics.forget(this, current);
             lyricLines.clear();
             activeLine = -1;
             lyricAdapter.notifyDataSetChanged();
-            lyricsList.setVisibility(View.GONE);
+            showLyrics(false);
             lyricsState.setVisibility(View.VISIBLE);
             lyricsState.setText("Looking up lyrics\u2026");
             lyricsFor = "";
@@ -152,7 +173,7 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         lyricsState.setOnClickListener(v -> {
             Track current = playback.current();
             if (current == null) return;
-            Lyrics.forget(this, current.artist, current.title);
+            Lyrics.forget(this, current);
             lyricsFor = "";
             loadLyrics();
         });
@@ -182,6 +203,20 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         pagerAdapter = new ArtPagerAdapter();
         pager.setAdapter(pagerAdapter);
         pager.setOffscreenPageLimit(1);
+        // A gentle parallax while the artwork is swiped: the outgoing cover drifts slightly
+        // slower than the finger and shrinks a touch, the incoming one settles up to size.
+        // Without it the cards simply slide past each other like two photographs, which
+        // reads as flat on a screen this large. The values are deliberately small â€” a big
+        // transform here fights the card's own rounded edges and starts to look cheap.
+        // Alpha only. This used to scale every page to 0.94 and shift it by up to 18dp,
+        // which opened a gap at the card's edge that the NEXT page - already attached
+        // because offscreenPageLimit is 1 - showed through as a strip of unrelated
+        // artwork. ViewPager2 does not clip a child that shrinks or moves, so the only
+        // transform that cannot leak a neighbour is one that keeps the page in its slot.
+        pager.setPageTransformer((page, position) -> {
+            final float distance = Math.min(1f, Math.abs(position));
+            page.setAlpha(1f - 0.25f * distance);
+        });
         pager.registerOnPageChangeCallback(new ViewPager2.OnPageChangeCallback() {
             @Override
             public void onPageSelected(int position) {
@@ -216,7 +251,23 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         findViewById(R.id.closeQueue).setOnClickListener(v -> queueSheet.setVisibility(View.GONE));
         findViewById(R.id.prevButton).setOnClickListener(v -> playback.previous());
         findViewById(R.id.nextButton).setOnClickListener(v -> playback.next(false));
-        playPause.setOnClickListener(v -> playback.toggle());
+        playPause.setOnClickListener(v -> {
+            playback.toggle();
+            // A small press-then-settle on the main transport. On a control this size the
+            // tap is the whole interaction, and a button that does not acknowledge it feels
+            // unresponsive even when the music starts immediately.
+            playPause.animate().cancel();
+            playPause.setScaleX(0.9f);
+            playPause.setScaleY(0.9f);
+            playPause.animate().scaleX(1f).scaleY(1f)
+                    .setDuration(240)
+                    .setInterpolator(new android.view.animation.OvershootInterpolator(2.2f))
+                    .start();
+        });
+        // The side controls get the same acknowledgement, scaled down so they do not
+        // compete with the main button.
+        pressBounce(findViewById(R.id.prevButton));
+        pressBounce(findViewById(R.id.nextButton));
         shuffle.setOnClickListener(v -> playback.setShuffle(!playback.isShuffle()));
         repeat.setOnClickListener(v -> playback.cycleRepeat());
 
@@ -248,6 +299,29 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         main.post(ticker);
     }
 
+    /**
+     * A quick dip and return for a transport button, layered on top of its own action.
+     *
+     * This must not install the click listener itself: prev/next already have one, and
+     * replacing it would have silently turned both buttons into decoration.
+     */
+    private static void pressBounce(final android.view.View view) {
+        if (view == null) return;
+        final Runnable bounce = () -> {
+            view.animate().cancel();
+            view.setScaleX(0.86f);
+            view.setScaleY(0.86f);
+            view.animate().scaleX(1f).scaleY(1f)
+                    .setDuration(200)
+                    .setInterpolator(new android.view.animation.OvershootInterpolator(2f))
+                    .start();
+        };
+        view.setOnTouchListener((v, event) -> {
+            if (event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) bounce.run();
+            return false;   // never consume: the real click must still arrive
+        });
+    }
+
     private void toggleQueue() {
         if (queueSheet.getVisibility() == View.VISIBLE) {
             queueSheet.setVisibility(View.GONE);
@@ -263,12 +337,26 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
      * Cached lyrics are shown immediately; otherwise a lookup runs in the background
      * and the sheet fills in as soon as the result arrives.
      */
+    /**
+     * Identity of the song whose lyrics are on screen.
+     *
+     * Prefers the catalogue id: artist+title+length cannot tell two uploads apart, and
+     * that is exactly how one song's sheet ended up under another. The string is only
+     * used to drop a late answer for a track the user has already moved past.
+     */
+    private static String lyricsKey(Track t) {
+        if (t == null) return "";
+        String id = t.id == null ? "" : t.id.trim();
+        if (!id.isEmpty()) return "id:" + id;
+        return t.title + "|" + t.artist + "|" + t.durationMs;
+    }
+
     private void loadLyrics() {
         Track t = playback.current();
         if (t == null) return;
-        final String key = t.title + "|" + t.artist;
+        final String key = lyricsKey(t);
         lyricsFor = key;
-        String cached = Lyrics.cached(this, t.artist, t.title);
+        String cached = Lyrics.cached(this, t);
         if (cached != null) {
             showLyrics(cached);
             return;
@@ -296,21 +384,37 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         lyricAdapter.notifyDataSetChanged();
         // Lyrics stay folded until the artwork is tapped; the player opens artwork-first.
         if (!lyricsExpanded) {
-            lyricsList.setVisibility(View.GONE);
+            showLyrics(false);
             lyricsState.setVisibility(View.GONE);
             return;
         }
         lyricsPanel.setVisibility(View.VISIBLE);
         if (!has) {
-            lyricsList.setVisibility(View.GONE);
+            showLyrics(false);
             lyricsState.setVisibility(View.VISIBLE);
             lyricsState.setText("No synced lyrics for this track");
             return;
         }
         lyricsState.setVisibility(View.GONE);
-        lyricsList.setVisibility(View.VISIBLE);
+        showLyrics(true);
         syncLyrics();
         scrollToActive();
+    }
+
+    /**
+     * Shows or hides the lyric rows together with the box that hosts them.
+     *
+     * The rows live inside a FrameLayout so the fade scrim can be drawn over their lower
+     * edge. That host carries layout_weight="1", and a GONE child's weight is skipped - so
+     * if the host stayed visible while the list was empty, the panel would keep a large blank
+     * area in the loading and error states. Every visibility change goes through here so the
+     * host, the rows and the scrim can never disagree.
+     */
+    private void showLyrics(boolean visible) {
+        int state = visible ? View.VISIBLE : View.GONE;
+        if (lyricsList != null) lyricsList.setVisibility(state);
+        if (lyricsFade != null) lyricsFade.setVisibility(state);
+        if (lyricsListHost != null) lyricsListHost.setVisibility(state);
     }
 
     /**
@@ -331,10 +435,10 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
 
         if (expand) {
             Track t = playback.current();
-            String cached = t == null ? null : Lyrics.cached(this, t.artist, t.title);
+            String cached = t == null ? null : Lyrics.cached(this, t);
             if (cached != null) showLyrics(cached);
             else if (!lyricLines.isEmpty()) {
-                lyricsList.setVisibility(View.VISIBLE);
+                showLyrics(true);
                 lyricsState.setVisibility(View.GONE);
                 syncLyrics();
             } else {
@@ -366,7 +470,7 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         lyricsHost.requestLayout();
         lyricsPanel.setVisibility(View.GONE);
         lyricsPanel.setAlpha(0f);
-        lyricsList.setVisibility(View.GONE);
+        showLyrics(false);
         lyricsState.setVisibility(View.GONE);
         lyricLines.clear();
         activeLine = -1;
@@ -407,7 +511,7 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
                     return;
                 }
                 lyricsPanel.setVisibility(View.GONE);
-                lyricsList.setVisibility(View.GONE);
+                showLyrics(false);
                 lyricsState.setVisibility(View.GONE);
             }
         });
@@ -463,12 +567,40 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         if (anim != null) anim.cancel();
     }
 
+    /**
+     * Saves the song that is playing, without disturbing playback.
+     *
+     * The download runs in the foreground service and reports through ProgressBus, so the
+     * stream keeps sounding while the file is fetched; the next start of this song opens
+     * from disk. A song already saved says so instead of queueing a pointless transfer.
+     */
+    private void downloadCurrentTrack() {
+        Track t = playback.current();
+        if (t == null) return;
+        if (t.localUri != null && !t.localUri.isEmpty()) {
+            Toast.makeText(this, "Already saved to your device", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        DownloadState.download(this, t,
+                playback.source().isEmpty() ? "Cartify" : playback.source());
+    }
+
     /** Overflow menu next to the title: song actions without leaving the player. */
     private void showTrackMenu() {
         Track t = playback.current();
         if (t == null) return;
         String subtitle = (t.artist == null || t.artist.isEmpty() ? "Unknown artist" : t.artist);
+        // Saving the song that is playing is the one action a stream needs most: it is
+        // the difference between "heard it once" and "kept it". Offered only when there
+        // is no local file, because saving an already-saved song does nothing.
+        MenuSheet.Item save = t.localUri.isEmpty()
+                ? new MenuSheet.Item(R.drawable.ic_download, "Download this song",
+                () -> DownloadState.download(this, t,
+                        playback.source().isEmpty() ? "Cartify" : playback.source()))
+                : new MenuSheet.Item(R.drawable.ic_download, "Saved to device", true, () -> {
+        });
         MenuSheet.show(this, t.title, subtitle,
+                save,
                 new MenuSheet.Item(R.drawable.ic_next, "Play next", () -> {
                     playback.playNext(t);
                     Toast.makeText(this, "Playing next", Toast.LENGTH_SHORT).show();
@@ -610,7 +742,19 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         }
         title.setText(t.title);
         artist.setText(t.artist.isEmpty() ? "Unknown artist" : t.artist);
-        source.setText(playback.source().isEmpty() ? "Cartify" : playback.source());
+        String from = playback.source().isEmpty() ? "Cartify" : playback.source();
+        // A streamed song is not on the device, and the player has to say so: otherwise
+        // it reads as a normal saved track that will simply stop working offline.
+        source.setText(playback.isStream() ? from + "  \u00b7  streaming" : from);
+        // The save button reflects reality: a song already on the device cannot be saved
+        // again, and one that is still streaming is exactly what this button is for.
+        if (playerDownload != null) {
+            boolean saved = t.localUri != null && !t.localUri.isEmpty();
+            playerDownload.setImageResource(
+                    saved ? R.drawable.ic_check : R.drawable.ic_download);
+            playerDownload.setAlpha(saved ? 0.55f : 1f);
+            playerDownload.setContentDescription(saved ? "Saved to device" : "Download this song");
+        }
         pillText.setText(playback.queue().size() + " song"
                 + (playback.queue().size() == 1 ? "" : "s") + " \u00b7 "
                 + (playback.source().isEmpty() ? "Cartify" : playback.source()));
@@ -639,7 +783,7 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
         lastIndex = index;
 
         // Lyrics belong to the song, so reload them whenever the track changes.
-        String key = t.title + "|" + t.artist;
+        String key = t.title + "|" + t.artist + "|" + t.durationMs;
         if (!key.equals(lyricsFor)) {
             // Every new song opens on its artwork: the lyric sheet is opt-in per track,
             // so switching songs (next, previous or a swipe) folds it back down.
@@ -658,7 +802,7 @@ public class PlayerActivity extends AppCompatActivity implements Playback.Listen
      * next slides in from the right, previous from the left.
      *
      * A hop to a neighbouring track uses the pager's own page slide, which shows the
-     * outgoing and incoming covers together — the closest thing to physically pushing
+     * outgoing and incoming covers together â€” the closest thing to physically pushing
      * the card aside. Anything further (a queue tap, a shuffled jump) would mean
      * scrolling through every page in between, so those are cut and the entering cover
      * is glided in from the correct side instead.

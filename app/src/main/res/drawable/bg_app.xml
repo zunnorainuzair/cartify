@@ -5,14 +5,34 @@
             <solid android:color="@color/bg_deep" />
         </shape>
     </item>
-    <item android:left="-160dp" android:right="240dp" android:top="-220dp" android:bottom="380dp">
-        <shape android:shape="oval">
-            <solid android:color="#164CE87F" />
+    <!-- Soft glows, not ovals.
+
+         These were two large <shape android:shape="oval"/> items positioned with negative
+         insets. A layer-list clips each item to its own bounds, and an oval smaller than the
+         screen leaves its bounding box filled to the edge - so the tint ended in a hard
+         vertical line at x=47 and x=452 on a 1080px screen, which read as dark green blocks
+         behind the title. A radial gradient that fades to fully transparent cannot produce
+         an edge at all. -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:type="radial"
+                android:centerX="0.16"
+                android:centerY="0.04"
+                android:gradientRadius="640dp"
+                android:startColor="#1F4CE87F"
+                android:endColor="#004CE87F" />
         </shape>
     </item>
-    <item android:left="180dp" android:right="-200dp" android:top="520dp" android:bottom="-260dp">
-        <shape android:shape="oval">
-            <solid android:color="#120A5C26" />
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:type="radial"
+                android:centerX="0.98"
+                android:centerY="0.46"
+                android:gradientRadius="540dp"
+                android:startColor="#160A5C26"
+                android:endColor="#000A5C26" />
         </shape>
     </item>
 </layer-list>

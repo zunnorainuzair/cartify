@@ -99,6 +99,14 @@ public class SplashView extends View {
         listener = l;
     }
 
+    /** Rewinds to frame zero so the intro always plays from the start. */
+    public void reset() {
+        stop();
+        t = 0f;
+        brandFired = false;
+        invalidate();
+    }
+
     public void start() {
         if (anim != null) return;
         anim = ValueAnimator.ofFloat(0f, 1f);
@@ -115,6 +123,10 @@ public class SplashView extends View {
         anim.addListener(new AnimatorListenerAdapter() {
             @Override
             public void onAnimationEnd(Animator a) {
+                // Cleared so the view can play again. Without this the field stays assigned
+                // to a finished animator, start()'s guard sees non-null and returns, and a
+                // replayed splash hangs motionless for its whole duration.
+                anim = null;
                 if (listener != null) listener.onFinished();
             }
         });
@@ -123,6 +135,10 @@ public class SplashView extends View {
 
     public void stop() {
         if (anim != null) {
+            // Listeners first: cancel() delivers onAnimationEnd, and onFinished() hides the
+            // splash. Without this, stopping an intro to replay it reported that it had
+            // completed and the new run was faded out before it drew a frame.
+            anim.removeAllListeners();
             anim.cancel();
             anim = null;
         }

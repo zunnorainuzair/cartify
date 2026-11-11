@@ -47,6 +47,10 @@ public final class LibraryStore {
             t.durationMs = duration;
             t.addedAt = addedAt;
             t.status = Track.DONE;
+            // A library song is identified by the file it is, not by its title. Two
+            // different songs can share a name and one song can exist twice, so lyrics
+            // and the "already saved" checks key on this; it must never be blank.
+            t.id = "local:" + (uri == null ? "" : uri);
             return t;
         }
     }
@@ -240,4 +244,5 @@ public final class LibraryStore {
         if (s.length() > 90) s = s.substring(0, 90).trim();
         return s.isEmpty() ? "Unknown" : s;
     }
+
 }

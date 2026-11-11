@@ -15,6 +15,9 @@ import java.util.List;
 /** Horizontal rail of album-style cards, the shape Spotify uses for its home shelves. */
 public class CardAdapter extends RecyclerView.Adapter<CardAdapter.VH> {
 
+    /** Artwork width for this list's rows, in pixels. Rows are small; full covers are not. */
+    private static final int CARD_ART_PX = 420;
+
     public interface Actions {
         void onOpen(Track track);
     }
@@ -45,7 +48,7 @@ public class CardAdapter extends RecyclerView.Adapter<CardAdapter.VH> {
         h.title.setText(t.title);
         String sub = (t.artist == null || t.artist.isEmpty()) ? "Unknown artist" : t.artist;
         h.subtitle.setText(sub);
-        Art.load(h.itemView.getContext(), t, h.art);
+        Art.load(h.itemView.getContext(), t, h.art, null, CARD_ART_PX);
         h.itemView.setOnClickListener(v -> actions.onOpen(t));
     }
 

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Backing for the floating search shelf.
+
+    The shelf sits ABOVE the results list and must hide the rows scrolling underneath it,
+    so it cannot be transparent. It also cannot be a flat fill: the page background is a
+    radial glow, and a solid rectangle on top of it ends in a hard horizontal edge that
+    reads as a black block behind the header. Fading to transparent over the lower third
+    keeps the cards legible and leaves no boundary.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="@color/surface"
+        android:centerColor="@color/surface"
+        android:endColor="#00000A02"
+        android:centerY="0.62" />
+</shape>

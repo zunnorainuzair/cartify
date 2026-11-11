@@ -2,8 +2,14 @@
 <resources>
     <style name="Theme.Cartify" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowBackground">@drawable/bg_app</item>
-        <item name="android:statusBarColor">@color/bg_deep</item>
-        <item name="android:navigationBarColor">@color/bg_deep</item>
+        <!-- Matched to the glow in @drawable/bg_app, not to bg_deep.
+
+             The bars were the darkest colour in the palette while the page behind them is a
+             green radial glow, so they read as a black band with a razor-straight lower edge.
+             surface tracks the gradient at that height, so the transition is a few points of
+             green instead of twenty-six. -->
+        <item name="android:statusBarColor">@color/surface</item>
+        <item name="android:navigationBarColor">@color/surface</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:colorAccent">@color/accent</item>
         <item name="android:textColorPrimary">@color/text_primary</item>

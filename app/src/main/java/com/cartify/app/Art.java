@@ -150,6 +150,17 @@ public final class Art {
         return "";
     }
 
+    /**
+     * Cache key for a size-restricted decode.
+     *
+     * Without the size in the key, a 120px row thumbnail and the full-screen player cover
+     * would collide in the same LRU entry: whichever decoded last would win, and the player
+     * would either show a blurry cover or the list would hold full-resolution bitmaps.
+     */
+    private static String sized(String key, int targetPx) {
+        return targetPx > 0 ? (key + "#w" + targetPx) : key;
+    }
+
     public static Bitmap cached(Track t) {
         String k = key(t);
         return k.isEmpty() ? null : CACHE.get(k);
@@ -185,6 +196,104 @@ public final class Art {
         load(context, track, view, null);
     }
 
+    /**
+     * Loads artwork restricted to about {@code targetPx} pixels wide (0 = full size).
+     *
+     * Library and queue rows were each holding a full-resolution cover - roughly 1.6 MB
+     * apiece - inside the shared 24 MB LRU, so a few hundred rows thrashed it and graphics
+     * memory sat around 100 MB. A row is 50dp tall; it never needs a 640px bitmap. Passing
+     * the real size lets the decode be subsampled for rows while the player still asks for
+     * full resolution, which is the only place the detail is actually visible.
+     */
+    public static void load(Context context, Track track, ImageView view, Loaded callback,
+                            int targetPx) {
+        String baseKey = key(track);
+        final String k = sized(baseKey, targetPx);
+        final int target = targetPx;
+        // A recycled row re-bound to the same track must not blank first.
+        if (k.equals(view.getTag()) && view.getDrawable() != null) {
+            if (callback != null) callback.onArtwork(!MISSING.contains(k));
+            return;
+        }
+        view.setTag(k);
+        view.setImageDrawable(null);
+        if (k.isEmpty() || baseKey.isEmpty()) {
+            if (callback != null) callback.onArtwork(false);
+            return;
+        }
+        Bitmap hit = CACHE.get(k);
+        if (hit != null) {
+            view.setImageBitmap(hit);
+            if (callback != null) callback.onArtwork(true);
+            return;
+        }
+        if (MISSING.contains(k)) {
+            if (callback != null) callback.onArtwork(false);
+            return;
+        }
+        synchronized (WAITING) {
+            List<ImageView> list = WAITING.get(k);
+            if (list == null) {
+                list = new ArrayList<>();
+                WAITING.put(k, list);
+            }
+            if (!list.contains(view)) list.add(view);
+        }
+        synchronized (IN_FLIGHT) {
+            if (!IN_FLIGHT.add(k)) return;
+        }
+        final Context app = context.getApplicationContext();
+        final String url = track.coverUrl;
+        final String uri = track.localUri;
+        POOL.execute(() -> {
+            // Temporary instrumentation: measure how long a cover actually takes to become
+            // paintable, split by source. The question is whether decode is under the 16 ms
+            // frame budget (nothing to fix) or well above it (worth decoding at target
+            // size instead of decoding full and scaling down).
+            final long t0 = android.os.SystemClock.elapsedRealtime();
+            // Disk and network both decode at full size (the disk file is shared with the
+            // player), so the shrink happens once here, before anything is cached.
+            Bitmap b = readDisk(app, baseKey);
+            final long tDisk = android.os.SystemClock.elapsedRealtime() - t0;
+            if (b == null && url != null && !url.isEmpty()) {
+                b = Net.bitmap(url);
+                if (b != null) writeDisk(app, baseKey, b);
+            }
+            if (b == null && uri != null && !uri.isEmpty()) {
+                b = embedded(app, uri);
+                if (b != null) writeDisk(app, baseKey, b);
+            }
+            if (b != null && target > 0 && b.getWidth() > target) {
+                Bitmap scaled = Bitmap.createScaledBitmap(b, target,
+                        Math.max(1, Math.round(b.getHeight() * (float) target / b.getWidth())),
+                        true);
+                if (scaled != b) b = scaled;
+            }
+            final Bitmap result = b;
+            List<ImageView> targets;
+            synchronized (WAITING) {
+                targets = WAITING.remove(k);
+            }
+            synchronized (IN_FLIGHT) {
+                IN_FLIGHT.remove(k);
+            }
+            if (result == null) {
+                MISSING.add(k);
+                if (callback != null) MAIN.post(() -> callback.onArtwork(false));
+                return;
+            }
+            CACHE.put(k, result);
+            if (callback != null) MAIN.post(() -> callback.onArtwork(true));
+            if (targets == null) return;
+            for (final ImageView v : targets) {
+                MAIN.post(() -> {
+                    if (k.equals(v.getTag())) v.setImageBitmap(result);
+                });
+            }
+        });
+    }
+
+    /** Full-resolution load, kept for the player and the mini player. */
     public static void load(Context context, Track track, ImageView view, Loaded callback) {
         String k = key(track);
         // A recycled row that is re-bound to the same track must not blank first. The old
@@ -365,6 +474,40 @@ public final class Art {
             total += n;
         }
         return total;
+    }
+
+    /**
+     * Loads artwork from a bare URL, for results that are not Tracks yet.
+     *
+     * Playlist search hits return a cover URL and nothing else: there is no Track to key the
+     * normal pipeline on, and inventing a fake Track just to borrow this cache would put a
+     * bogus entry in every other lookup. This shares CACHE and the disk cache under the URL
+     * itself, so a playlist cover seen again - as a local playlist's artwork, say - is free.
+     */
+    public static void loadUrl(ImageView view, String url, int targetPx) {
+        if (view == null) return;
+        if (url == null || url.isEmpty()) {
+            view.setImageDrawable(null);
+            return;
+        }
+        final String key = targetPx > 0 ? (url + "#w" + targetPx) : url;
+        Bitmap hit = CACHE.get(key);
+        if (hit != null) {
+            view.setImageBitmap(hit);
+            return;
+        }
+        final Context app = view.getContext().getApplicationContext();
+        final int target = targetPx;
+        POOL.execute(() -> {
+            Bitmap b = CACHE.get(key);
+            if (b == null) b = Net.bitmap(url, target);
+            if (b == null) return;
+            final Bitmap result = b;
+            CACHE.put(key, result);
+            MAIN.post(() -> {
+                if (key.equals(view.getTag())) view.setImageBitmap(result);
+            });
+        });
     }
 
     private static byte[] fromRetriever(Context context, String uri) {

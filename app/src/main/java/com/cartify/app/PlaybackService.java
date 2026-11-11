@@ -39,6 +39,11 @@ public class PlaybackService extends Service implements Playback.Listener {
     public static final String ACTION_SHUFFLE = "com.cartify.app.PLAYBACK_SHUFFLE";
     public static final String ACTION_REPEAT = "com.cartify.app.PLAYBACK_REPEAT";
     public static final String ACTION_SEEK = "com.cartify.app.PLAYBACK_SEEK";
+    /** Jump backwards or forwards by {@link #SEEK_STEP_MS} from the notification. */
+    public static final String ACTION_SEEK_BACK = "com.cartify.app.PLAYBACK_SEEK_BACK";
+    public static final String ACTION_SEEK_FORWARD = "com.cartify.app.PLAYBACK_SEEK_FORWARD";
+    /** 10 seconds: the step every podcast and music player uses for a nudge. */
+    public static final long SEEK_STEP_MS = 10_000L;
     public static final String EXTRA_POSITION = "position";
 
     private static final String CHANNEL_ID = "cartify_playback";
@@ -155,6 +160,12 @@ public class PlaybackService extends Service implements Playback.Listener {
                 case ACTION_SEEK:
                     playback.seekTo(intent.getLongExtra(EXTRA_POSITION, 0));
                     break;
+                case ACTION_SEEK_BACK:
+                    nudge(-SEEK_STEP_MS);
+                    break;
+                case ACTION_SEEK_FORWARD:
+                    nudge(SEEK_STEP_MS);
+                    break;
                 default:
                     break;
             }
@@ -168,6 +179,22 @@ public class PlaybackService extends Service implements Playback.Listener {
         }
         pushState();
         return START_NOT_STICKY;
+    }
+
+    /**
+     * Moves playback by {@code deltaMs}, clamped inside the track.
+     *
+     * Seeking straight to a negative position throws on some MediaPlayer builds and a
+     * position past the end simply stops the song, so both ends are clamped here rather
+     * than leaving the rounding to the player.
+     */
+    private void nudge(long deltaMs) {
+        long dur = playback.duration();
+        long target = playback.position() + deltaMs;
+        if (target < 0) target = 0;
+        if (dur > 0 && target > dur - 500L) target = Math.max(0, dur - 500L);
+        playback.seekTo(target);
+        onPlaybackChanged();
     }
 
     // ------------------------------------------------------------------ state
@@ -271,6 +298,12 @@ public class PlaybackService extends Service implements Playback.Listener {
             b.addAction(R.drawable.ic_repeat,
                     repeatMode == Playback.REPEAT_ALL ? "Repeat all" : "Repeat off", repeat);
         }
+        // Ten-second nudges in the expanded view. The compact three stay transport only,
+        // because scrubbing from the shade is what the progress bar is for. The circular
+        // arrow icon is deliberate: reusing the prev/next chevrons here read as "another
+        // track" rather than "ten seconds", which is the one thing a seek control must not do.
+        b.addAction(R.drawable.ic_rewind_10, "Back 10s", action(ACTION_SEEK_BACK, 6));
+        b.addAction(R.drawable.ic_forward_10, "Forward 10s", action(ACTION_SEEK_FORWARD, 7));
 
         Bitmap art = t == null ? null : Art.cached(t);
         if (art != null) b.setLargeIcon(art);

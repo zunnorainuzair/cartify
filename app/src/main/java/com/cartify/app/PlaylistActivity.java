@@ -55,6 +55,18 @@ public class PlaylistActivity extends AppCompatActivity implements Playback.List
     private final List<Track> library = new ArrayList<>();
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        AppLifecycle.onActivityStarted();
+    }
+
+    @Override
+    protected void onStop() {
+        AppLifecycle.onActivityStopped();
+        super.onStop();
+    }
+
+    @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_playlist);
