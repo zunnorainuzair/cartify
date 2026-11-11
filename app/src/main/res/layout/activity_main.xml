@@ -22,6 +22,8 @@
             android:layout_marginBottom="10dp"
             android:background="@drawable/bg_update_banner"
             android:clickable="true"
+            android:clipChildren="false"
+            android:clipToPadding="false"
             android:focusable="true"
             android:gravity="center_vertical"
             android:orientation="horizontal"
@@ -31,16 +33,29 @@
             android:paddingBottom="9dp"
             android:visibility="gone">
 
-            <View
-                android:id="@+id/updateDot"
-                android:layout_width="9dp"
-                android:layout_height="9dp"
-                android:background="@drawable/bg_update_dot" />
+            <!-- The dot pulses to 1.6x, so it lives inside a fixed box big enough for the
+                 largest frame. Scaling the bare 9dp view made the circle grow past the
+                 banner's 12dp start padding and crowd the rounded edge, which read as a
+                 clipped circle at full size. The box reserves the room up front, so the
+                 pulse never touches anything. -->
+            <FrameLayout
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:clipChildren="false"
+                android:clipToPadding="false">
+
+                <View
+                    android:id="@+id/updateDot"
+                    android:layout_width="9dp"
+                    android:layout_height="9dp"
+                    android:layout_gravity="center"
+                    android:background="@drawable/bg_update_dot" />
+            </FrameLayout>
 
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="10dp"
+                android:layout_marginStart="3dp"
                 android:layout_weight="1"
                 android:orientation="vertical">
 

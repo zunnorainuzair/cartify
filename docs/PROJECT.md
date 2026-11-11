@@ -312,13 +312,31 @@ one real bug and made the download survive a bad connection.
 | Readable notes | `plainNotes()` strips markdown, so the sheet no longer shows literal `##` and `**` |
 | Honest manual check | `checkWithStatus()` distinguishes up to date / offline / GitHub unavailable; the automatic check stays silent |
 | Size in the UI | the banner and sheet show the download size (`formatSize`) |
+| Dot room | `updateDot` sits in a 16dp `FrameLayout` with `clipChildren=false`, and the banner no longer clips its children |
+
+### The pulsing dot looked cut when fully grown
+
+The dot was a bare 9dp `View` scaled to 1.6x by `startUpdatePulse()`. At full size it grew
+past the banner's 12dp start padding and crowded the rounded edge, so the circle read as
+clipped. It now lives in a fixed 16dp `FrameLayout` with `clipChildren="false"`, and the
+banner itself stopped clipping its children. Measured on device across the pulse: the dot
+is 1.00 round at every frame (24-36 px at 2.625 density) and stays inside the banner.
+
+That fix went into the same **v1.2.0** release: the APK asset was replaced (new SHA-256
+`e4d481c4...`) rather than publishing a new tag, because the version had only just been
+released.
 
 ### Verified
 
-- `releases/latest` for `zunnorainuzair/cartify` returns `v1.1.0`, asset
-  `cartify-1.1.0.apk` (111,305,367 bytes) with a `sha256:` digest.
-- The release build is signed with the Android debug key, the same key the installed
-  v1.1.0 uses, so an in-app upgrade is accepted by the installer.
+- `releases/latest` for `zunnorainuzair/cartify` returned `v1.1.0` (asset
+  `cartify-1.1.0.apk`, 111,305,367 bytes) while the device ran v1.1.0, and the app offered
+  the update on launch.
+- **The update was then run end to end on the Pixel 7 Pro**: the banner showed
+  "Update available - v1.2.0" with the flattened notes and "106 MB", the download wrote
+  `cartify-v1.2.0.apk.part` in `cache/updates`, and the app finished at
+  `versionName=1.2.0 versionCode=4` with the banner gone afterwards.
+- The release build is signed with the Android debug key, the same key v1.1.0 used, so the
+  in-app upgrade is accepted by the installer.
 
 ## 7-stream. Streaming start latency - measured 11 November 2026
 
